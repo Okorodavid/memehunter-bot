@@ -16,6 +16,7 @@ from memehunter.providers.base import (Holding, TokenMarket,          # noqa: E4
                                        extract_addresses)
 from memehunter.providers.solana import SolanaProvider, classify_bot  # noqa: E402
 from memehunter.bot import harvest_labels                             # noqa: E402
+import tests_auto                                                     # noqa: E402
 import tests_exits                                                    # noqa: E402
 
 PASSED = FAILED = 0
@@ -343,6 +344,7 @@ async def main() -> int:
     await test_db()
     test_render()
     tests_exits.run(check)
+    await tests_auto.run(check)
     print(f"\n{PASSED} passed, {FAILED} failed")
     return 1 if FAILED else 0
 

@@ -17,6 +17,7 @@ class EvmProvider:
         self.chain = chain if chain in EVM_CHAINS else "ethereum"
         self.chainid = EVM_CHAINS[self.chain]["chainid"]
         self.explorer = EVM_CHAINS[self.chain]["explorer"]
+        self.decimals = EVM_CHAINS[self.chain].get("decimals", 18)
         self.http = HttpClient(rate=4, per=1.0)
 
     @property
@@ -155,7 +156,10 @@ class EvmProvider:
     async def native_balance(self, address: str) -> float:
         res = await self._call("account", "balance", address=address, tag="latest")
         try:
-            return int(res) / 1e18
+            # Not every chain's gas token has 18 decimals -- Arc charges gas in
+            # USDC, which has 6. Hardcoding 1e18 would overstate a balance by a
+            # factor of a trillion.
+            return int(res) / (10 ** self.decimals)
         except (TypeError, ValueError):
             return 0.0
 

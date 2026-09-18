@@ -13,14 +13,57 @@ SOL_ADDR = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 EVM_ADDR = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
 # Etherscan V2: one key, chain selected by chainid.
+# Every chain reachable through one Etherscan V2 key.
+#
+# `dex_ids` are the strings DexScreener may use for the chain in its API. We match
+# on a set rather than the key alone because DexScreener names newer chains before
+# there is any documented list, and guessing a single spelling wrong would silently
+# resolve that chain's tokens to Ethereum and query the wrong contract entirely.
+# Add a spelling here if a token on one of these chains resolves oddly.
 EVM_CHAINS: dict[str, dict[str, Any]] = {
-    "ethereum": {"chainid": 1, "explorer": "https://etherscan.io", "native": "ETH"},
-    "base": {"chainid": 8453, "explorer": "https://basescan.org", "native": "ETH"},
-    "bsc": {"chainid": 56, "explorer": "https://bscscan.com", "native": "BNB"},
-    "arbitrum": {"chainid": 42161, "explorer": "https://arbiscan.io", "native": "ETH"},
-    "polygon": {"chainid": 137, "explorer": "https://polygonscan.com", "native": "MATIC"},
-    "avalanche": {"chainid": 43114, "explorer": "https://snowscan.xyz", "native": "AVAX"},
+    "ethereum": {"chainid": 1, "explorer": "https://etherscan.io", "native": "ETH",
+                 "decimals": 18, "dex_ids": {"ethereum", "eth", "mainnet"}},
+    "base": {"chainid": 8453, "explorer": "https://basescan.org", "native": "ETH",
+             "decimals": 18, "dex_ids": {"base"}},
+    "bsc": {"chainid": 56, "explorer": "https://bscscan.com", "native": "BNB",
+            "decimals": 18, "dex_ids": {"bsc", "binance", "bnb", "binance-smart-chain"}},
+    "arbitrum": {"chainid": 42161, "explorer": "https://arbiscan.io", "native": "ETH",
+                 "decimals": 18, "dex_ids": {"arbitrum", "arbitrumone", "arb"}},
+    "polygon": {"chainid": 137, "explorer": "https://polygonscan.com", "native": "MATIC",
+                "decimals": 18, "dex_ids": {"polygon", "matic"}},
+    "avalanche": {"chainid": 43114, "explorer": "https://snowscan.xyz", "native": "AVAX",
+                  "decimals": 18, "dex_ids": {"avalanche", "avax"}},
+    # Arbitrum Orbit L2, launched July 2026. Gas is ETH. Most of its DEX volume
+    # runs through memecoins and launchpads rather than the tokenised equities.
+    "robinhood": {"chainid": 4663, "explorer": "https://robinhoodchain.blockscout.com",
+                  "native": "ETH", "decimals": 18,
+                  "dex_ids": {"robinhood", "robinhoodchain", "robinhood-chain",
+                              "hood", "rhc"}},
+    # Circle's L1, mainnet September 2026. Gas is paid in USDC, not an 18-decimal
+    # coin, which is why `decimals` exists on these entries at all.
+    "arc": {"chainid": 5042, "explorer": "https://arc-scan.org", "native": "USDC",
+            "decimals": 6, "dex_ids": {"arc", "arcmainnet", "arc-mainnet", "circlearc"}},
 }
+
+# Reverse lookup: whatever DexScreener called the chain -> our key.
+DEX_ID_TO_CHAIN: dict[str, str] = {
+    dex_id: chain
+    for chain, meta in EVM_CHAINS.items()
+    for dex_id in meta["dex_ids"]
+}
+
+
+def chain_from_dex_id(dex_id: str) -> str | None:
+    """Map a DexScreener chain string onto a chain we can actually query.
+
+    Returns None when the token lives somewhere we have no provider for. The
+    caller must treat that as "unsupported", never as a reason to fall back to
+    Ethereum -- querying the wrong chain returns plausible, wrong wallets.
+    """
+    if not dex_id:
+        return None
+    key = dex_id.strip().lower().replace("_", "-")
+    return DEX_ID_TO_CHAIN.get(key) or DEX_ID_TO_CHAIN.get(key.replace("-", ""))
 
 # Addresses that are never a "buyer": routers, burn holes, common quote tokens.
 IGNORE_ADDRESSES = {
@@ -41,6 +84,13 @@ IGNORE_ADDRESSES = {
 IGNORE_LOWER = {a.lower() for a in IGNORE_ADDRESSES}
 
 # Wrapped native token per chain, used to price the wallet's native balance.
+#
+# Robinhood Chain and Arc are deliberately absent. Their wrapped-native contract
+# addresses are not confirmed here, and a wrong address would price someone's gas
+# balance against an unrelated token -- a silently wrong portfolio total is worse
+# than an admittedly incomplete one. A chain missing from this map simply has its
+# native balance left out of the total; token positions still price normally.
+# Add the address here once verified and native pricing turns on with no other change.
 WRAPPED_NATIVE = {
     "solana": "So11111111111111111111111111111111111111112",
     "ethereum": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",

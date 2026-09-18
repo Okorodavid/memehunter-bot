@@ -36,7 +36,7 @@ locked down, since anyone with access burns your API quota.
 |---|---|---|
 | `SOLSCAN_API_KEY` | yes | earliest buyers on Solana in one call. **The one that matters most.** |
 | `HELIUS_API_KEY` | yes | fast parsed swap history + a private RPC instead of the public one |
-| `ETHERSCAN_API_KEY` | yes | every EVM chain (ETH, Base, BSC, Arbitrum, Polygon, Avalanche) through one V2 key |
+| `ETHERSCAN_API_KEY` | yes | every EVM chain through one V2 key: Ethereum, Base, BSC, Robinhood Chain, Arc, Arbitrum, Polygon, Avalanche |
 
 Market data comes from DexScreener, which needs no key at all.
 
@@ -67,7 +67,123 @@ than hand you a plausible-looking list of wallets that were never actually early
 /sells on|off          exit alerts specifically (on by default)
 /minscore <n>          only alert on entries at or above this score (default 6)
 /settings
+
+/autoscan on|off       run /scan on a timer, reporting only what changed
+/queue <token>         line up past runners to be mined for early buyers
+/autoharvest on|off    work through that queue, one coin per cycle
+/trending              what is being boosted right now, to pick from
+
+/leaderboard           grade every wallet on how its calls to you performed
 ```
+
+## Running it unattended
+
+Four jobs run on their own once the bot is up. They start staggered so a restart
+does not fire all of them into the same rate limit.
+
+| Job | Default | What it does |
+|---|---|---|
+| Watcher | every 10m | diffs balances, alerts on entries and exits |
+| Outcomes | every 20m | re-prices open alerts so the leaderboard has data |
+| Auto-scan | every 6h | steps 5–7 across every tracked wallet |
+| Auto-harvest | every 12h | mines one queued coin for early buyers |
+
+**Auto-scan only messages you when something moved** — a token reaching the overlap
+bar for the first time, picking up another wallet, or its score shifting half a point.
+A digest that repeated the same overlap every six hours would train you to ignore it.
+The cost of that choice is worth stating plainly: silence means nothing changed, not
+that nothing ran. `/settings` shows which jobs are on and how often they fire; if you
+want to confirm a scan actually happened, `/scan` runs the same thing on demand.
+
+**Auto-harvest does one coin per cycle**, not the whole queue. Early-buyer lookups are
+the most expensive call the bot makes, and firing twenty at once is the fastest way to
+get rate limited off the free tiers. A queue of ten works itself off over five days.
+
+Step 1 of the method — which past winner to mine — stays yours. `/queue` is a list you
+fill. `/trending` shows what DexScreener is boosting so you have names to pick from, but
+read that list for what it is: tokens somebody **paid** to put in front of you, which is
+close to the opposite of what step 1 asks for. It is a place to spot names, not a source
+of past winners. No free API exposes "coins that already did 100x", so that judgement
+does not get automated here.
+
+## Chains
+
+| Chain | Needs | Notes |
+|---|---|---|
+| Solana | Solscan / Helius key | the deepest history, and what the method was written for |
+| Ethereum, Base, BSC | Etherscan V2 key | mature, years of past cycles to mine |
+| Arbitrum, Polygon, Avalanche | Etherscan V2 key | supported, thin memecoin flow |
+| Robinhood Chain (4663) | Etherscan V2 key | Arbitrum Orbit L2, live July 2026 |
+| Arc (5042) | Etherscan V2 key | Circle L1, live September 2026. Gas is USDC, not ETH |
+
+Chain is detected from the address you paste; there is no mode to switch. Etherscan's
+free community endpoints for Robinhood Chain and Arc expire **15 October 2026**, after
+which those two need a Lite plan.
+
+**An EVM wallet is watched on every EVM chain.** Track `0xABC` on Base and it is
+tracked on Arc, Robinhood, BSC and the rest too, because the same address is the same
+person everywhere — a wallet with a good record on Base is exactly the one you want to
+hear about the first time it appears on a new chain. `/tracked` shows one entry per
+wallet with the chains it is actually active on. Solana keys have no equivalent
+elsewhere, so they are never expanded. Turn it off with `MULTICHAIN=0`, or narrow it
+with `MULTICHAIN_CHAINS=base,arc`.
+
+Watching eight chains would cost eight times as much if it were naive, so chains a
+wallet has no history on are **parked** after three consecutive empty reads and retried
+every 12 hours. Three, not one, because Etherscan returns an empty list for a failed
+request as well as for a genuinely empty wallet, and parking on a single blip would
+silently stop watching a chain. The retry is what lets a wallet that starts using Arc
+next month still get picked up.
+
+**Overlap never crosses chains.** Step 6 — the same coin in three wallets — is computed
+per chain, because a Solana mint and a Base contract are different tokens. Tracking ten
+Solana wallets and ten Arc wallets is two separate hunts, not one with twenty. Pick a
+chain and go deep before adding another.
+
+**Young chains break step 1.** The method starts with a coin from a *previous cycle*, and
+then asks which of its early buyers are still active 30 days later. Arc is days old and
+Robinhood Chain is months old, so on those chains there is barely a past to mine and the
+"still active after 30 days" filter has almost nothing to cut. They will work properly
+once they have history; today they are a bet that early movers there become the wallets
+worth following later.
+
+**Sui is not supported.** It is not an EVM chain and Etherscan does not cover it, so it
+needs a provider of its own rather than a line in the chain table.
+
+## The leaderboard
+
+`/leaderboard` ranks your tracked wallets by **how their calls to you actually turned
+out** — not by their own historical PnL.
+
+That distinction is the whole point. A wallet's lifetime PnL is measured on entries you
+could not take, at prices you never got, mostly from positions opened long before you
+started watching. It tells you the wallet was good once. So every entry alert records the
+price at the moment it fired, the price is re-checked every 20 minutes for 72 hours, and
+the wallet is graded on that record alone.
+
+| Column | Meaning |
+|---|---|
+| `2/3 hit 1.50x` | how many of its calls reached the win bar |
+| `peak avg` | average best price each call reached |
+| `now avg` | where those calls stand today |
+| grade | hit rate shrunk toward a 25% base rate by sample size |
+
+Three things that ranking gets right, and are worth knowing before you trust it:
+
+- **Peak, not last.** A coin that went 4x and came back to flat was a good call badly
+  managed. Grading it as a loss would tell you to drop a wallet that keeps handing you
+  4x. Both numbers are shown, and a wallet whose calls consistently round-trip is
+  labelled **"good entries, you must exit yourself"** rather than praised.
+- **Small samples are shrunk.** A wallet that is 1-for-1 is not better than one that is
+  12-for-20, so confidence rises with sample size instead of being asserted. Under three
+  calls a wallet grades `NEW` and is not ranked seriously.
+- **It prunes on evidence.** Wallets silent for three weeks, or graded `D` over five or
+  more calls, are listed as worth dropping. Step 3 of the method is discarding dead
+  wallets, and one you tracked last month can die like any other.
+
+The honest limit: this needs time. A wallet with two calls tells you nothing, and the
+board is only as good as the alert history behind it. Expect a fortnight before the
+ranking means much, and treat anything above it as provisional.
 
 Tracking a wallet first snapshots what it already holds, so your first alert is a genuinely
 new buy rather than a replay of the last month.
@@ -108,7 +224,7 @@ You can drive the same pipeline from a terminal without Telegram:
 
 ```bash
 python -m memehunter.cli analyze <token>
-python selftest.py          # 119 offline checks, no network or keys needed
+python selftest.py          # 244 offline checks, no network or keys needed
 ```
 
 ## The scoring system
@@ -201,8 +317,9 @@ to zero.
 main.py                     entry point
 selftest.py                 offline checks
 tests_exits.py              exit-detection and sizing checks
+tests_auto.py               scheduling, queue and leaderboard checks
 memehunter/
-  bot.py                    commands, buttons, watcher job
+  bot.py                    commands, buttons, and the four scheduled jobs
   render.py                 all Telegram output
   config.py  db.py          settings, SQLite
   providers/
@@ -214,4 +331,5 @@ memehunter/
     scoring.py              step 7
     events.py               balance diffing: buys, adds, trims, exits
     portfolio.py            pricing a book, and scaling conviction to your bankroll
+    leaderboard.py          grading wallets on how their calls actually performed
 ```

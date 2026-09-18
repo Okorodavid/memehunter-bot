@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable
 
 from ..config import CFG
 from ..providers.base import (EVM_CHAINS, EarlyBuyer, Holding, TokenMarket,
+                              chain_from_dex_id,
                               WalletProfile, detect_chain)
 from ..providers.evm import EvmProvider
 from ..providers.prices import DexScreener
@@ -89,18 +90,36 @@ class Analyzer:
         market = await self.dex.market(address)
         if kind == "solana":
             return "solana", market
-        chain = (market.chain if market and market.chain in EVM_CHAINS else "ethereum")
-        return chain, market
+
+        if market and market.chain:
+            # An unrecognised chain is returned as-is so the caller can name it.
+            # Falling back to Ethereum here would query a real contract at the
+            # same address on the wrong chain and hand back wallets that were
+            # never early on anything.
+            return chain_from_dex_id(market.chain) or market.chain, market
+
+        # No pair anywhere: too new, or not a token. Ethereum is the only sane
+        # guess, and the lookup that follows will come back empty if it is wrong.
+        return "ethereum", market
 
     def explorer_token(self, chain: str, token: str) -> str:
         if chain == "solana":
             return f"https://solscan.io/token/{token}"
-        return f"{EVM_CHAINS[chain]['explorer']}/token/{token}"
+        meta = EVM_CHAINS.get(chain)
+        if not meta:
+            # An unsupported chain can still reach rendering via an error path.
+            # A DexScreener link always resolves, so it beats crashing on a
+            # missing explorer.
+            return f"https://dexscreener.com/{chain}/{token}"
+        return f"{meta['explorer']}/token/{token}"
 
     def explorer_wallet(self, chain: str, wallet: str) -> str:
         if chain == "solana":
             return f"https://solscan.io/account/{wallet}"
-        return f"{EVM_CHAINS[chain]['explorer']}/address/{wallet}"
+        meta = EVM_CHAINS.get(chain)
+        if not meta:
+            return f"https://blockscan.com/address/{wallet}"
+        return f"{meta['explorer']}/address/{wallet}"
 
     # ------------------------------------------------------- steps 2 -> 4 only
     async def find_smart_wallets(
@@ -109,12 +128,21 @@ class Analyzer:
         limit = limit or CFG.early_buyer_count
         chain, market = await self.resolve_chain(token)
         res = TokenAnalysis(token=token, chain=chain, market=market)
-        prov = self.provider(chain)
 
+        if chain != "solana" and chain not in EVM_CHAINS:
+            res.error = (
+                f"That token trades on {chain}, which this bot cannot query. "
+                f"Supported: solana, {', '.join(sorted(EVM_CHAINS))}."
+            )
+            return res
         if chain != "solana" and not self.evm(chain).enabled:
-            res.error = "ETHERSCAN_API_KEY is not set, so EVM chains are unavailable."
+            res.error = (
+                f"ETHERSCAN_API_KEY is not set, so {chain} is unavailable. "
+                f"One free key from etherscan.io/apis covers every EVM chain."
+            )
             return res
 
+        prov = self.provider(chain)
         await progress(f"Step 2 - pulling the first {limit} buyers on {chain}...")
         try:
             res.early_buyers = await prov.early_buyers(token, limit)

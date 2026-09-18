@@ -7,9 +7,10 @@ import time
 from .config import CFG
 from .pipeline.analyzer import Analyzer, Candidate, TokenAnalysis
 from .pipeline.events import HEADLINE, PositionEvent
+from .pipeline.leaderboard import WalletCard
 from .pipeline.portfolio import Portfolio, Sizing
 from .pipeline.scoring import Score
-from .providers.base import WalletProfile, short
+from .providers.base import TokenMarket, WalletProfile, short
 
 MAX_MSG = 3900
 
@@ -201,6 +202,151 @@ def render_portfolio(pf: Portfolio, az: Analyzer, label: str | None = None) -> s
     if pf.truncated:
         lines.append(f"<i>Only the first {CFG.max_priced_holdings} holdings "
                      f"were priced.</i>")
+    return clip("\n".join(lines))
+
+
+def multiple(x: float) -> str:
+    return f"{x:.2f}x" if x < 10 else f"{x:.0f}x"
+
+
+def render_leaderboard(cards: list[WalletCard], summary: dict, az: Analyzer,
+                       limit: int = 12) -> str:
+    """Wallets ranked by what their calls were worth to you, not by their own PnL."""
+    win = summary["win_multiple"]
+    if not summary["signals"]:
+        return (
+            "<b>Wallet leaderboard</b>\n\n"
+            "No graded calls yet. The board fills as alerts fire and their coins "
+            "are re-priced, so it needs <code>/watch on</code> and a few days.\n\n"
+            "<i>It deliberately does not rank wallets by their historical PnL. "
+            "That is measured on entries you could not take, at prices you never "
+            "got. This ranks them only on calls you actually received.</i>"
+        )
+
+    lines = [
+        "<b>Wallet leaderboard</b>",
+        f"{summary['signals']} graded calls across {summary['wallets']} wallets - "
+        f"<b>{summary['hit_rate']:.0%}</b> reached {multiple(win)}, "
+        f"median peak {multiple(summary['median_peak'])}",
+        "",
+    ]
+
+    for i, card in enumerate(cards[:limit], 1):
+        who = esc(card.label) if card.label else short(card.wallet, 5, 5)
+        link = az.explorer_wallet(card.chain, card.wallet)
+        lines.append(
+            f'{i}. <b>[{card.grade}]</b> <a href="{link}">{who}</a> - '
+            f"{card.hits}/{card.signals} hit {multiple(win)}"
+        )
+        detail = (f"   peak avg {multiple(card.avg_peak)} | "
+                  f"now avg {multiple(card.avg_last)}")
+        if card.open_count:
+            detail += f" | {card.open_count} still live"
+        lines.append(detail)
+        if card.best_symbol and card.best_peak > 1.2:
+            lines.append(f"   best: {esc(card.best_symbol)} {multiple(card.best_peak)}"
+                         f" | last call {ago(card.last_signal_ts)}")
+        lines.append(f"   <i>{esc(card.verdict)}</i>")
+        lines.append("")
+
+    graded = summary["graded"]
+    if not graded:
+        lines.append("<i>Nothing has 3+ calls yet, so every grade above still "
+                     "says NEW. Ranking is provisional until then.</i>")
+    else:
+        lines.append(
+            f"<i>Grades use a hit rate shrunk toward {CFG.leaderboard_prior_rate:.0%} "
+            f"by sample size, so a wallet that is 1-for-1 does not outrank one that "
+            f"is 12-for-20. Peak is what the coin reached, not what it held.</i>"
+        )
+    return clip("\n".join(lines))
+
+
+def render_wallet_card(card: WalletCard, az: Analyzer) -> str:
+    who = esc(card.label) if card.label else short(card.wallet, 6, 6)
+    lines = [
+        f'<b><a href="{az.explorer_wallet(card.chain, card.wallet)}">{who}</a></b> '
+        f"- grade <b>{card.grade}</b>",
+        f"{card.hits}/{card.signals} calls reached "
+        f"{multiple(CFG.outcome_win_multiple)}  ({card.hit_rate:.0%})",
+        f"Average peak {multiple(card.avg_peak)} | median {multiple(card.median_peak)} "
+        f"| now {multiple(card.avg_last)}",
+    ]
+    if card.best_symbol:
+        lines.append(f"Best: {esc(card.best_symbol)} {multiple(card.best_peak)}")
+    if card.worst_symbol and card.worst_last < 0.9:
+        lines.append(f"Worst: {esc(card.worst_symbol)} {multiple(card.worst_last)}")
+    lines.append(f"Last call {ago(card.last_signal_ts)}")
+    if card.round_trip:
+        lines.append("\n<i>Their entries work but their coins give it all back. "
+                     "Following this wallet means taking profit on your own "
+                     "schedule - they will not tell you when.</i>")
+    return "\n".join(lines)
+
+
+def render_scan_digest(blocks: list[tuple[str, Candidate, str]], az: Analyzer) -> str:
+    """Only what changed since the last automatic scan."""
+    reason_text = {
+        "new": "NEW",
+        "stronger": "MORE WALLETS",
+        "rescored": "RESCORED",
+    }
+    lines = [f"<b>Auto-scan</b> - {len(blocks)} change(s) since last run\n"]
+    for chain, cand, reason in blocks:
+        tag = reason_text.get(reason, reason.upper())
+        lines.append(f"<b>[{tag}]</b> on {esc(chain)}")
+        lines.append(render_candidate(cand, az))
+        lines.append("")
+    lines.append("<i>Silence between these means nothing changed, not that "
+                 "nothing ran.</i>")
+    return clip("\n".join(lines))
+
+
+def render_queue(rows: list, az: Analyzer) -> str:
+    if not rows:
+        return (
+            "<b>Harvest queue is empty</b>\n\n"
+            "Add coins that already ran with <code>/queue &lt;token&gt;</code> and the "
+            "harvester works through them one per cycle, mining each for early "
+            "buyers.\n\n"
+            "<i>Step 1 of the method is a judgement call - which past winner to "
+            "mine - so the bot does not make it for you. <code>/trending</code> "
+            "gives you a list to pick from.</i>"
+        )
+    pending = [r for r in rows if r["status"] == "pending"]
+    lines = [f"<b>Harvest queue</b> - {len(pending)} pending, "
+             f"{len(rows) - len(pending)} done\n"]
+    for r in rows[:20]:
+        name = esc(r["symbol"]) if r["symbol"] else short(r["token"], 5, 5)
+        mark = {"pending": "...", "done": "ok", "failed": "!!"}.get(r["status"], "?")
+        line = f"  [{mark}] {name} <code>{short(r['token'], 4, 4)}</code>"
+        if r["note"]:
+            line += f" - <i>{esc(r['note'])}</i>"
+        lines.append(line)
+    return clip("\n".join(lines))
+
+
+def render_trending(markets: list[TokenMarket], az: Analyzer,
+                    chain: str = "solana") -> str:
+    if not markets:
+        return (f"DexScreener has nothing boosted on {esc(chain)} right now. "
+                f"Try another chain, or again in a minute.")
+    lines = [
+        f"<b>Currently boosted on {esc(chain)}</b>\n",
+    ]
+    for i, m in enumerate(markets[:12], 1):
+        lines.append(
+            f"{i}. <b>{esc(m.symbol or m.address[:6])}</b> - {usd(m.price_usd)} | "
+            f"liq {usd(m.liquidity_usd)} | vol24h {usd(m.volume_24h)} | "
+            f"{m.price_change_24h:+.0f}%"
+        )
+        lines.append(f"   <code>{esc(m.address)}</code>")
+    lines.append(
+        "\n<i>These are tokens someone paid to promote, not coins that already "
+        "ran. That is the opposite of what the method asks for in step 1 - treat "
+        "this as a place to spot names, then queue the ones you judge worth "
+        "mining with /queue.</i>"
+    )
     return clip("\n".join(lines))
 
 

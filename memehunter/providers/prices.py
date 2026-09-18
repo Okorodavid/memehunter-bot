@@ -4,6 +4,7 @@ from __future__ import annotations
 from .base import HttpClient, TokenMarket
 
 DEX_TOKENS = "https://api.dexscreener.com/latest/dex/tokens/"
+DEX_BOOSTS = "https://api.dexscreener.com/token-boosts/top/v1"
 # DexScreener allows ~300 req/min; 30 token addresses per call.
 BATCH = 30
 
@@ -58,6 +59,38 @@ class DexScreener:
     async def market(self, address: str) -> TokenMarket | None:
         res = await self.markets([address])
         return res.get(address) or res.get(address.lower())
+
+    async def boosted(self, chain: str = "solana", limit: int = 30) -> list[TokenMarket]:
+        """Tokens currently paying for promotion on DexScreener.
+
+        Read this for what it is. It is an attention list, not a list of past
+        winners -- somebody paid to put each of these in front of you, which is
+        the opposite of the method's step 1. It is here because scanning for
+        "coins that already did 100x" is not something any free API exposes, and
+        skimming a live list beats typing addresses from memory. You still pick.
+        """
+        try:
+            data = await self.http.get(DEX_BOOSTS)
+        except Exception:
+            return []
+        addresses = [
+            entry.get("tokenAddress") for entry in (data or [])
+            if isinstance(entry, dict)
+            and entry.get("chainId") == chain
+            and entry.get("tokenAddress")
+        ]
+        if not addresses:
+            return []
+        markets = await self.markets(addresses[:limit])
+        seen: set[str] = set()
+        out: list[TokenMarket] = []
+        for addr in addresses[:limit]:
+            m = markets.get(addr) or markets.get(addr.lower())
+            if m and m.address not in seen:
+                seen.add(m.address)
+                out.append(m)
+        out.sort(key=lambda m: m.volume_24h, reverse=True)
+        return out
 
     async def aclose(self) -> None:
         await self.http.aclose()

@@ -23,6 +23,23 @@ def _float(key: str, default: float) -> float:
         return default
 
 
+def _bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _chain_list(key: str) -> tuple[str, ...]:
+    """Chains to expand an EVM wallet across. Empty env value means all of them."""
+    from .providers.base import EVM_CHAINS  # imported late to avoid a cycle
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return tuple(EVM_CHAINS)
+    wanted = [c.strip().lower() for c in raw.replace(";", ",").split(",") if c.strip()]
+    return tuple(c for c in wanted if c in EVM_CHAINS) or tuple(EVM_CHAINS)
+
+
 @dataclass(frozen=True)
 class Config:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -57,6 +74,40 @@ class Config:
     max_priced_holdings: int = _int("MAX_PRICED_HOLDINGS", 120)
 
     watcher_interval_min: int = _int("WATCHER_INTERVAL_MIN", 10)
+
+    # Watch an EVM wallet on every EVM chain, not just the one you added it on.
+    # The same address is the same person everywhere, so a wallet with a good
+    # record on Base is worth watching when it first appears on Arc.
+    multichain: bool = _bool("MULTICHAIN", True)
+    multichain_chains: tuple[str, ...] = field(
+        default_factory=lambda: _chain_list("MULTICHAIN_CHAINS"))
+    # Chains where the wallet shows no history get parked after this many
+    # consecutive empty reads, and retried this often.
+    multichain_dormant_after: int = _int("MULTICHAIN_DORMANT_AFTER", 3)
+    multichain_reprobe_hours: float = _float("MULTICHAIN_REPROBE_HOURS", 12)
+    multichain_probes_per_cycle: int = _int("MULTICHAIN_PROBES_PER_CYCLE", 12)
+
+    # Automatic scanning. /scan runs steps 5-7 on demand; autoscan runs the same
+    # work on a timer and only speaks when something actually changed, so a quiet
+    # market stays quiet instead of sending you an identical digest every cycle.
+    autoscan_hours: float = _float("AUTOSCAN_INTERVAL_HOURS", 6)
+    autoscan_min_score: float = _float("AUTOSCAN_MIN_SCORE", 7.0)
+
+    # Automatic harvesting: work through the queue of past runners one coin at a
+    # time, so a long queue spreads its API cost over days instead of one burst.
+    autoharvest_hours: float = _float("AUTOHARVEST_INTERVAL_HOURS", 12)
+    autoharvest_max_wallets: int = _int("AUTOHARVEST_MAX_WALLETS", 10)
+
+    # Outcome tracking: what happened to each coin after an alert fired. This is
+    # what the wallet leaderboard is built from.
+    outcome_check_min: int = _int("OUTCOME_CHECK_MIN", 20)
+    outcome_track_hours: float = _float("OUTCOME_TRACK_HOURS", 72)
+    outcome_win_multiple: float = _float("OUTCOME_WIN_MULTIPLE", 1.5)
+    # Small samples are shrunk toward this base rate so a wallet that is 1-for-1
+    # cannot outrank one that is 12-for-20.
+    leaderboard_prior_rate: float = _float("LEADERBOARD_PRIOR_RATE", 0.25)
+    leaderboard_prior_weight: float = _float("LEADERBOARD_PRIOR_WEIGHT", 4)
+
     db_path: str = os.getenv("DB_PATH", "memehunter.db")
 
     @property
