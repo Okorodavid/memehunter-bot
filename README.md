@@ -34,13 +34,14 @@ locked down, since anyone with access burns your API quota.
 
 | Key | Free tier | Buys you |
 |---|---|---|
-| `SOLSCAN_API_KEY` | yes | earliest buyers on Solana in one call. **The one that matters most.** |
-| `HELIUS_API_KEY` | yes | fast parsed swap history + a private RPC instead of the public one |
-| `ETHERSCAN_API_KEY` | yes | every EVM chain through one V2 key: Ethereum, Base, BSC, Robinhood Chain, Arc, Arbitrum, Polygon, Avalanche |
+| `HELIUS_API_KEY` | yes | a coin's first buyers in one call, whatever its size, plus parsed swap history and a private RPC. **The one that matters most.** |
+| `SOLSCAN_API_KEY` | no | the Pro API answers a free-plan key with `401 Please upgrade your api key level`. Only worth setting on a paid plan |
+| `ETHERSCAN_API_KEY` | partly | one V2 key, but the free plan now covers only Ethereum, Arbitrum and Polygon. Base and Avalanche fall back to keyless public explorers (Blockscout, Routescan); BSC, Robinhood Chain and Arc need a paid plan |
+| `BLOCKSCOUT_API_KEY` | yes | optional. Only raises Blockscout's rate limits; Base works without it |
 
 Market data comes from DexScreener, which needs no key at all.
 
-Without a Solscan key the bot falls back to paginating the public Solana RPC backwards
+Without Helius or Solscan the bot falls back to paginating the public Solana RPC backwards
 through a token's signature history. That works for small and mid-size coins. For a coin
 with millions of transactions it will tell you it could not reach the first buyers rather
 than hand you a plausible-looking list of wallets that were never actually early.
@@ -53,10 +54,12 @@ than hand you a plausible-looking list of wallets that were never actually early
 /score <token>         step 7 only - run one coin through the scoring system
 
 /harvest <token> [n]   scan a coin and track every surviving early buyer at once
+/traders <token> [n]   the wallets that put in least and took out most
 /add                   guided manual add - paste one wallet or a whole column
 /track <wallet> [label] [chain]     the same thing in one line
 /label <wallet> <name> rename a tracked wallet
-/untrack <wallet>
+/untrack               list every wallet with an Untrack button, and a sweep for idle ones
+/untrack <wallet>      stop following one wallet, or several pasted at once
 /tracked
 /scan                  steps 5-7 across every wallet you track, on demand
 
@@ -74,7 +77,62 @@ than hand you a plausible-looking list of wallets that were never actually early
 /trending              what is being boosted right now, to pick from
 
 /leaderboard           grade every wallet on how its calls to you performed
+/diag                  test every API key and name which one is broken
 ```
+
+## Pruning without typing an address
+
+`/untrack` on its own lists every wallet you follow, eight to a page, each with
+its own Untrack button. Wallets that have gone quiet on every chain they are
+watched on are marked `(idle)`, and one button at the bottom drops all of them
+at once after asking.
+
+The leaderboard carries the same buttons. You are already looking at the
+evidence for dropping a wallet there, so you should not have to copy its
+address into another command to act on it. Pressing one removes the button and
+leaves the board itself alone, so the ranks you are reading do not renumber
+under you.
+
+Idle means dormant on every chain, which is only set after several consecutive
+empty reads. One failed lookup does not mark a wallet dead.
+
+## Who made money, not just who was early
+
+Being early is a timestamp. Turning twenty dollars into two thousand is a
+decision taken twice, once to size and once to sell. `/traders <token>` ranks
+the wallets that did it:
+
+```
+1. 7xKq..3mAe  60x
+   in $13.00 (3.5M / 1 tx)  out $783.00 (3.5M / 1 tx)
+   profit $770.00
+```
+
+`/harvest` runs the same scan and tracks those wallets alongside the early
+buyers, labelled `VCAT 60x` rather than `VCAT early #3`. Set `HARVEST_TRADERS=0`
+to keep harvests to early buyers only.
+
+The ranking is on the **multiple**, not the profit, or it would only ever find
+whoever traded biggest. `TRADER_MIN_SPEND_USD` keeps out the wallet that risked
+a fraction of a cent and shows a five-figure multiple.
+
+**Where the numbers come from.** DexScreener shows this table on its own site
+but does not serve it through its API — `io.dexscreener.com` answers every
+request with a bot challenge — so the bot computes it from the chain:
+
+| Chain | How | Coverage |
+|---|---|---|
+| Solana | the coin's transactions, read from both ends, per-owner balance deltas | every trader, unless the coin is older than `TRADER_SCAN_PAGES` allows |
+| EVM | per wallet: its transfers of the coin, what it spent, and the internal call that paid it back | the early-buyer cohort only |
+
+The EVM limit is not a shortcut. Base caps `eth_getLogs` near 2,000 blocks and a
+Uniswap v4 coin has no pair contract to filter on, so reading a whole token's
+history keylessly is not possible. The output says so when it applies.
+
+**Multiples are exact; dollars are not.** A multiple is computed in the quote
+asset, SOL or ETH, before any conversion. The dollar figures price old trades at
+today's rate, so read them as scale rather than as a statement of what someone
+banked.
 
 ## Running it unattended
 
@@ -106,13 +164,127 @@ close to the opposite of what step 1 asks for. It is a place to spot names, not 
 of past winners. No free API exposes "coins that already did 100x", so that judgement
 does not get automated here.
 
+## When a lookup comes back empty
+
+Every data source here fails quietly by default. Etherscan answers a rejected key
+with the same shape it uses for "no results". Solscan answers one with a bare 401.
+The Solana RPC just returns nothing. Each of those used to surface as *"no early
+buyers found"* — a statement about the coin, when it was really a statement about
+a broken credential.
+
+That is fixed in two places. Each provider now keeps the API's own error text and
+the bot repeats it verbatim, and **`/diag`** asks every source a question it must be
+able to answer:
+
+```
+[ok] DexScreener        SOL at $105.55
+[ok] Helius RPC         at slot 312,884,201
+[!!] Solscan            key rejected (401)
+[ok] Blockscout / base  chainid 8453, answered
+```
+
+The explorer named is the one that answered. Etherscan's free plan refuses Base, so
+the bot hands Base to Blockscout on the first refusal and says so here.
+
+`/diag` starts with Telegram, because a bot that cannot reach Telegram cannot report
+anything, including its own diagnostics. That line shows what each resolver says
+about `api.telegram.org`, which is what the next section is about.
+
+## Starting it with the laptop
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_autostart.ps1
+```
+
+That registers a scheduled task which starts the bot a minute after you log in,
+restarts it up to three times if it dies, and keeps it running on battery. It
+runs as you, needs no administrator rights and stores no password. Remove it
+with the same command and `-Uninstall`.
+
+| Command | What it does |
+|---|---|
+| `Start-ScheduledTask -TaskName 'Memehunter bot'` | start it now without logging out |
+| `Stop-ScheduledTask -TaskName 'Memehunter bot'` | stop it |
+| `Get-ScheduledTaskInfo -TaskName 'Memehunter bot'` | when it last ran |
+| `Get-Content bot.log -Tail 20` | what it is doing |
+
+It runs under `pythonw.exe`, so nothing appears on screen. The bot writes
+`bot.log` itself rather than relying on a shell to redirect its output, and
+rotates it at 2 MB.
+
+A logon trigger can fire before the Wi-Fi associates, so a start that cannot
+reach Telegram now waits and retries, backing off from 5 seconds to 5 minutes
+before giving up. A bad token or a second copy already running are treated as
+permanent and stop immediately, because retrying either would only repeat the
+same failure every few minutes for as long as the laptop is on.
+
+The task only runs while you are logged in. Closing the lid or logging out
+stops the bot, and anything a tracked wallet does in the meantime is missed.
+A machine that stays on is still the only way to watch continuously.
+
+## Only one copy at a time
+
+Two copies of the bot both ask Telegram for updates, and Telegram gives each
+update to whichever asked first. Commands then land in one process or the other
+at random, which looks like the bot ignoring you. The only clue is a line buried
+in the log:
+
+```
+telegram.error.Conflict: Conflict: terminated by other getUpdates request
+```
+
+So a second copy now refuses to start and says why. It claims a local port for
+as long as it runs, which the operating system releases whenever the process
+ends - a lock file left behind by a crash would block every later start.
+
+## When the network lies about an address
+
+Some networks answer `api.telegram.org` with an address that is not Telegram's. Here
+it comes back as `108.160.166.137`, which belongs to Dropbox and never completes a
+handshake, so the bot dies at startup with:
+
+```
+telegram.error.NetworkError: httpx.ConnectError: All connection attempts failed
+```
+
+That reads like the bot being offline. It is one wrong lookup - Telegram's real
+addresses route fine from the same machine, with no VPN.
+
+Pointing at a public DNS server does not fix it on its own. Measured on this network,
+half the plain-UDP queries **sent to 8.8.8.8** came back with the forged address:
+something answers port 53 first, whoever you asked.
+
+```
+20 queries to 8.8.8.8 -> 10 real answers, 10 forged
+```
+
+So the bot resolves those names over HTTPS instead, where a forged reply cannot
+survive TLS. The resolvers are addressed by IP, so this needs no working DNS to get
+started, and the answers are served to every library in the process. Nothing about
+the machine's settings changes, and no VPN is involved.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `DNS_FIX` | `1` | turn the whole thing off with `0` |
+| `DNS_OVERRIDE_HOSTS` | `api.telegram.org` | names resolved over HTTPS instead of by the network |
+| `DNS_RESOLVERS` | Google, Cloudflare | DNS-over-HTTPS endpoints, tried in order |
+
+Every other name still goes to your normal resolver first. A name only falls through
+to HTTPS when that resolver fails or blackholes it, so private and internal names keep
+working as before.
+
+If a chain fails there, anything on it will come back empty — and that emptiness is
+the failure, not a verdict on a coin.
+
 ## Chains
 
 | Chain | Needs | Notes |
 |---|---|---|
-| Solana | Solscan / Helius key | the deepest history, and what the method was written for |
-| Ethereum, Base, BSC | Etherscan V2 key | mature, years of past cycles to mine |
-| Arbitrum, Polygon, Avalanche | Etherscan V2 key | supported, thin memecoin flow |
+| Solana | Helius key (or a paid Solscan plan) | the deepest history, and what the method was written for |
+| Ethereum, Arbitrum, Polygon | Etherscan V2 key (free plan), or keyless Blockscout | mature, years of past cycles to mine |
+| Base | nothing - keyless Blockscout; Etherscan only on a paid plan | most of the EVM memecoin flow |
+| Avalanche | nothing - keyless Routescan; Etherscan only on a paid plan | thin memecoin flow |
+| BSC | Etherscan V2 key on a paid plan | no keyless public explorer |
 | Robinhood Chain (4663) | Etherscan V2 key | Arbitrum Orbit L2, live July 2026 |
 | Arc (5042) | Etherscan V2 key | Circle L1, live September 2026. Gas is USDC, not ETH |
 
@@ -149,6 +321,17 @@ worth following later.
 
 **Sui is not supported.** It is not an EVM chain and Etherscan does not cover it, so it
 needs a provider of its own rather than a line in the chain table.
+
+## Surviving a host with no disk
+
+Free container hosts rebuild the filesystem on every redeploy, which would take
+the tracked wallets, position baselines and alert history with it. So the bot backs
+its database up to your Telegram chat every 6 hours and pins it, and restores from
+the pinned copy when it starts up empty. `/backup` and `/restore` do it by hand;
+`DEPLOY.md` has the detail.
+
+Restore only fires automatically when there are no tracked wallets *and* no alert
+history, so it can never overwrite real work.
 
 ## The leaderboard
 
@@ -224,7 +407,7 @@ You can drive the same pipeline from a terminal without Telegram:
 
 ```bash
 python -m memehunter.cli analyze <token>
-python selftest.py          # 244 offline checks, no network or keys needed
+python selftest.py          # 273 offline checks, no network or keys needed
 ```
 
 ## The scoring system

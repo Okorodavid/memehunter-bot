@@ -305,12 +305,45 @@ async def set_label(conn, chat_id: int, address: str, label: str) -> int:
 
 
 async def remove_wallet(conn, chat_id: int, address: str) -> int:
+    """Stop tracking a wallet, and forget what we knew about it.
+
+    Deleting only the tracked_wallets rows left the wallet's position history
+    and its alert record behind. Re-tracking it then compared today's holdings
+    against balances from whenever it was dropped, so a wallet that had simply
+    been sold out of announced a string of exits the moment it came back. The
+    rows also never went anywhere: one wallet here still had 219 of them.
+
+    The position tables are shared between chats rather than scoped to one, so
+    they are only cleared when no other chat is still tracking the address.
+    The leaderboard's outcome history is deliberately kept: it is the record of
+    what the wallet actually did, and untracking is not a reason to lose it.
+    """
     cur = await conn.execute(
         "DELETE FROM tracked_wallets WHERE chat_id = ? AND lower(address) = lower(?)",
         (chat_id, address),
     )
+    removed = cur.rowcount
+    if not removed:
+        await conn.commit()
+        return 0
+
+    # Lets a re-tracked wallet alert again instead of being deduped forever.
+    await conn.execute(
+        "DELETE FROM alerts_sent WHERE chat_id = ? AND lower(wallet) = lower(?)",
+        (chat_id, address),
+    )
+
+    still_tracked = await (await conn.execute(
+        "SELECT 1 FROM tracked_wallets WHERE lower(address) = lower(?) LIMIT 1",
+        (address,),
+    )).fetchone()
+    if not still_tracked:
+        for table in ("wallet_positions", "wallet_seen"):
+            await conn.execute(
+                f"DELETE FROM {table} WHERE lower(wallet) = lower(?)", (address,))
+
     await conn.commit()
-    return cur.rowcount
+    return removed
 
 
 async def list_wallets(conn, chat_id: int) -> list[aiosqlite.Row]:
@@ -598,7 +631,25 @@ async def update_outcome(conn, outcome_id: int, last_price: float,
     await conn.commit()
 
 
-async def outcomes_for_chat(conn, chat_id: int) -> list[aiosqlite.Row]:
+async def outcomes_for_chat(conn, chat_id: int,
+                            tracked_only: bool = False) -> list[aiosqlite.Row]:
+    """Graded alerts for this chat.
+
+    `tracked_only` drops the ones belonging to wallets no longer followed. The
+    rows themselves are kept: untracking a wallet is a decision to stop hearing
+    from it, not a reason to destroy the record of how its past calls turned
+    out. Re-track it and its grade comes back intact.
+    """
+    if tracked_only:
+        return list(await (await conn.execute(
+            "SELECT o.* FROM alert_outcomes o"
+            " WHERE o.chat_id = ? AND EXISTS ("
+            "   SELECT 1 FROM tracked_wallets t"
+            "    WHERE t.chat_id = o.chat_id"
+            "      AND lower(t.address) = lower(o.wallet))"
+            " ORDER BY o.opened_at DESC",
+            (chat_id,),
+        )).fetchall())
     return list(await (await conn.execute(
         "SELECT * FROM alert_outcomes WHERE chat_id = ? ORDER BY opened_at DESC",
         (chat_id,),
@@ -659,3 +710,39 @@ async def set_min_score(conn, chat_id: int, score: float) -> None:
         (chat_id, score),
     )
     await conn.commit()
+
+
+async def wallet_summary(conn, chat_id: int) -> list[aiosqlite.Row]:
+    """One row per tracked wallet, with how many chains it is still live on.
+
+    The picker needs a wallet, not a wallet-chain pair. A multichain EVM wallet
+    has eight rows and listing all of them would offer the same address eight
+    times.
+    """
+    return list(await (await conn.execute(
+        "SELECT address,"
+        "       MAX(label) AS label,"
+        "       MAX(source_token) AS source_token,"
+        "       MIN(added_at) AS added_at,"
+        "       SUM(CASE WHEN dormant = 0 THEN 1 ELSE 0 END) AS live_chains,"
+        "       COUNT(*) AS chains"
+        "  FROM tracked_wallets WHERE chat_id = ?"
+        " GROUP BY address ORDER BY added_at DESC, address",
+        (chat_id,),
+    )).fetchall())
+
+
+async def idle_wallets(conn, chat_id: int) -> list[str]:
+    """Wallets showing no activity on any chain they are watched on.
+
+    Dormancy is only set after several consecutive empty reads, so this is not
+    one failed lookup -- it is a wallet the bot has repeatedly found nothing
+    for. Step 3 of the method is dropping exactly these.
+    """
+    rows = await (await conn.execute(
+        "SELECT address FROM tracked_wallets WHERE chat_id = ?"
+        " GROUP BY address HAVING SUM(CASE WHEN dormant = 0 THEN 1 ELSE 0 END) = 0"
+        " ORDER BY MIN(added_at)",
+        (chat_id,),
+    )).fetchall()
+    return [r["address"] for r in rows]

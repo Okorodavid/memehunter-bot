@@ -7,16 +7,19 @@ import time
 from functools import wraps
 from typing import Any, Callable
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (BotCommand, BotCommandScopeAllPrivateChats,
+                      BotCommandScopeDefault, InlineKeyboardButton,
+                      InlineKeyboardMarkup, MenuButtonCommands, Update)
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram.ext import (Application, ApplicationBuilder, CallbackQueryHandler,
                           CommandHandler, ContextTypes, ConversationHandler,
                           MessageHandler, filters)
 
-from . import db, render
+from . import backup, db, diagnostics, render
 from .config import CFG
 from .pipeline.analyzer import Analyzer
+from .pipeline import traders as traders_pipeline
 from .pipeline.events import diff_positions, looks_like_read_failure
 from .pipeline.leaderboard import (build_scorecards, stale_wallets, summarise,
                                    underperformers)
@@ -34,11 +37,13 @@ HELP = """<b>Memehunter</b> - the seven-step smart-money hunt, automated.
 /analyze &lt;token&gt; - all seven steps: wallets, their recent buys, overlaps, scores
 
 <b>Track them</b>
-/harvest &lt;token&gt; [n] - scan a coin and track every surviving early buyer at once
+/harvest &lt;token&gt; [n] [chain] - scan a coin and track every surviving early buyer
+/traders &lt;token&gt; [n] - the wallets that put in least and took out most
+   (/harvest tracks these as well; HARVEST_TRADERS=0 turns that off)
 /add - add a wallet by hand, guided step by step (paste one or many)
 /track &lt;wallet&gt; [label] [chain] - same thing in one line
 /label &lt;wallet&gt; &lt;name&gt; - rename a tracked wallet
-/untrack &lt;wallet&gt;
+/untrack - list every wallet with an Untrack button, or /untrack &lt;wallet&gt;
 /tracked - list what you are watching
 /scan - run steps 5-7 across every wallet you track, right now
 
@@ -50,6 +55,10 @@ HELP = """<b>Memehunter</b> - the seven-step smart-money hunt, automated.
 
 <b>Rank your wallets</b>
 /leaderboard - grade every wallet on how its calls to you actually performed
+
+<b>Keep your data</b>
+/backup - send the database to this chat and pin it
+/restore - restore from the pinned backup, or reply /restore to an older one
 
 Or just paste an address into the chat and I will ask whether it is a wallet
 to track or a token to analyse.
@@ -66,11 +75,82 @@ to track or a token to analyse.
 /sells on|off - exit alerts specifically (on by default)
 /minscore &lt;n&gt; - only alert on entries at or above this score (default 6)
 /settings - show current configuration
+/diag - test every API key and name what is broken
 
 Paste a Solana mint or an EVM contract address anywhere a &lt;token&gt; is asked for.
 
 <i>Exits are as public as entries, but you always see them second.
 Nothing here is financial advice.</i>"""
+
+
+
+# What Telegram shows when someone types "/". Order is the order it appears in,
+# so the three commands a session usually starts with come first rather than
+# whatever happens to sort early. Telegram allows 100; this is 26.
+#
+# Kept here rather than generated from the handlers on purpose: several
+# handlers are aliases or internal steps (/skip, /board) that would only add
+# noise to the menu, and a description has to be written by hand anyway.
+COMMAND_MENU = [
+    ("harvest", "Scan a coin and track its early buyers and best traders"),
+    ("traders", "Who put in least and took out most on a coin"),
+    ("wallets", "The early buyers of a coin, with Track buttons"),
+    ("analyze", "All seven steps on one coin"),
+    ("score", "Score one coin out of 10"),
+    ("trending", "What DexScreener is boosting right now"),
+
+    ("tracked", "Every wallet you follow"),
+    ("add", "Add a wallet by hand, guided"),
+    ("track", "Add a wallet in one line"),
+    ("untrack", "Pick wallets to stop following, or sweep the idle ones"),
+    ("label", "Rename a tracked wallet"),
+    ("wallet", "Price one wallet's whole book"),
+
+    ("scan", "What your wallets are crowding into now"),
+    ("leaderboard", "Grade every wallet on how its calls performed"),
+    ("queue", "Line up a past runner to mine later"),
+
+    ("watch", "Live alerts on entries and exits: on or off"),
+    ("sells", "Exit alerts specifically: on or off"),
+    ("minscore", "Only alert at or above this score"),
+    ("bankroll", "Your account size, so alerts scale to you"),
+    ("autoscan", "Run /scan on a timer: on or off"),
+    ("autoharvest", "Work through the queue on a timer: on or off"),
+    ("settings", "Show the current configuration"),
+
+    ("diag", "Test every data source and name what is broken"),
+    ("backup", "Send the database to this chat"),
+    ("restore", "Restore the database from a backup"),
+    ("help", "What every command does"),
+]
+
+
+async def publish_command_menu(bot) -> bool:
+    """Register the commands so typing "/" lists them.
+
+    Telegram keeps this list server-side, per bot, until it is replaced. A bot
+    that never calls this works perfectly well and looks like it has no
+    commands at all, which is how this one looked.
+
+    Three calls, not one. A client resolves the list from the narrowest scope
+    that has one, so writing only the default scope leaves a client that has
+    already cached an empty private-chat list showing nothing. The menu button
+    is set as well, because that is the button a reader actually taps.
+    """
+    commands = [BotCommand(name, description) for name, description in COMMAND_MENU]
+    try:
+        # Clearing first makes the client treat this as a change. Re-sending an
+        # identical list can be ignored, cache and all.
+        await bot.delete_my_commands(scope=BotCommandScopeDefault())
+        await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+        await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except TelegramError as exc:
+        # Not worth failing a startup over: every command still works typed out.
+        log.warning("could not publish the command menu: %r", exc)
+        return False
+    log.info("published %d commands to the Telegram menu", len(COMMAND_MENU))
+    return True
 
 
 # --------------------------------------------------------------------------- auth
@@ -115,8 +195,22 @@ def conn(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send(update: Update, text: str, **kw) -> Any:
-    return await update.effective_message.reply_text(
-        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kw)
+    """Reply, over several messages when the text is too long for one.
+
+    Telegram caps a message at 4,096 characters and rejects the whole thing if
+    a tag is left open at the cut. That used to surface as the command sending
+    nothing at all, so the splitting happens here rather than in each caller.
+    """
+    pages = render.pages(text)
+    markup = kw.pop("reply_markup", None)
+    sent = None
+    for i, page in enumerate(pages):
+        last = i == len(pages) - 1
+        sent = await update.effective_message.reply_text(
+            page, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            # Buttons belong on the final page, where the reader ends up.
+            **({"reply_markup": markup} if last and markup else {}), **kw)
+    return sent
 
 
 def cohort_keyboard(context: ContextTypes.DEFAULT_TYPE, res, token: str):
@@ -144,6 +238,15 @@ def cohort_keyboard(context: ContextTypes.DEFAULT_TYPE, res, token: str):
     return InlineKeyboardMarkup(rows)
 
 
+def chain_arg(args) -> str | None:
+    """An explicit chain name anywhere in the command's arguments.
+
+    An EVM address exists on every EVM chain, so when DexScreener has no pair
+    for a token there is nothing to infer from and the bot has to be told.
+    """
+    return next((a.lower() for a in args if a.lower() in EVM_CHAINS), None)
+
+
 class Progress:
     """Edits a single status message instead of spamming the chat."""
 
@@ -157,8 +260,14 @@ class Progress:
         self._last = text
         try:
             await self.message.edit_text(text)
-        except BadRequest:
+        except TelegramError:
+            # Every Telegram failure, not just BadRequest. This is a cosmetic
+            # status line, and a timeout updating it used to escape and abort
+            # the scan underneath -- losing a minute of real work because a
+            # progress message could not be redrawn.
             pass
+        except Exception:
+            log.debug("progress update failed", exc_info=True)
 
 
 # ----------------------------------------------------------------------- commands
@@ -171,17 +280,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @busy_guard
 async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await send(update, "Usage: <code>/wallets &lt;token address&gt;</code>")
+        await send(update, "Usage: <code>/wallets &lt;token&gt; [n] [chain]</code>")
         return
     token = context.args[0]
     limit = CFG.early_buyer_count
     if len(context.args) > 1 and context.args[1].isdigit():
         limit = max(5, min(50, int(context.args[1])))
 
+    hint = chain_arg(context.args[1:])
     status = await update.effective_message.reply_text("Step 2 - resolving token...")
     progress = Progress(status)
     try:
-        res = await az(context).find_smart_wallets(token, progress, limit)
+        res = await az(context).find_smart_wallets(token, progress, limit, hint)
     except ValueError as exc:
         await status.edit_text(str(exc))
         return
@@ -191,7 +301,7 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if res.error:
-        await status.edit_text(res.error)
+        await status.edit_text(res.error, parse_mode=ParseMode.HTML)
         return
 
     lines = [
@@ -285,6 +395,14 @@ def harvest_labels(symbol: str, addresses: list[str]) -> dict[str, str]:
     """Name harvested wallets after the coin that surfaced them, in entry order."""
     tag = (symbol or "?").strip()[:12] or "?"
     return {a: f"{tag} early #{i}" for i, a in enumerate(addresses, 1)}
+
+def trader_labels(symbol: str, traders) -> dict[str, str]:
+    """Name a harvested trader after what it made of the coin, not its rank.
+
+    "VCAT 60x" says why the wallet is worth watching in a way "VCAT early #3"
+    cannot: it sized small, it sold, and it was right.
+    """
+    return {t.wallet: f"{symbol} {t.multiple:,.0f}x" for t in traders}
 
 
 async def do_track(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -388,7 +506,7 @@ async def cmd_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Steps 2-4 on a coin, then track every wallet that survives the filters."""
     if not context.args:
         await send(update, (
-            "Usage: <code>/harvest &lt;token&gt; [n]</code>\n\n"
+            "Usage: <code>/harvest &lt;token&gt; [n] [chain]</code>\n\n"
             "Runs the early-buyer scan on a coin and adds every surviving wallet to "
             "your tracking list in one go."
         ))
@@ -397,13 +515,22 @@ async def cmd_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     limit = CFG.early_buyer_count
     if len(context.args) > 1 and context.args[1].isdigit():
         limit = max(5, min(50, int(context.args[1])))
+    hint = chain_arg(context.args[1:])
 
     message = await update.effective_message.reply_text("Resolving token...")
     progress = Progress(message)
     try:
-        res = await az(context).find_smart_wallets(token, progress, limit)
+        res = await az(context).find_smart_wallets(token, progress, limit, hint)
     except ValueError as exc:
         await message.edit_text(str(exc))
+        return
+    except NetworkError as exc:
+        log.warning("harvest: telegram network error: %r", exc)
+        await send(update, (
+            f"Lost the connection to Telegram partway through ({render.esc(str(exc))}).\n\n"
+            f"That is your link to Telegram, not the coin or your API keys. "
+            f"Run the same command again."
+        ))
         return
     except Exception as exc:
         log.exception("harvest failed")
@@ -411,7 +538,7 @@ async def cmd_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if res.error:
-        await message.edit_text(res.error)
+        await message.edit_text(res.error, parse_mode=ParseMode.HTML)
         return
     if not res.survivors:
         await message.edit_text(
@@ -435,11 +562,97 @@ async def cmd_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.delete()
     except BadRequest:
         pass
+    if CFG.harvest_traders:
+        await harvest_top_traders(update, context, token, res, progress)
+
     if added:
         await send(update, (
             f"Harvested <b>{render.esc(symbol)}</b>. Use /scan to see what these "
             f"wallets are already crowding into, or /watch on for live alerts."
         ))
+
+
+async def harvest_top_traders(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              token: str, res, progress) -> int:
+    """Track the wallets that made the most of this coin from the least.
+
+    Run as part of /harvest because it answers the question the early-buyer
+    list only half answers. Being early is a timestamp. Turning a small entry
+    into a large exit is a decision, taken twice -- once to size, once to sell.
+    A failure here is reported and dropped: the early buyers are already
+    tracked by this point and are worth keeping on their own.
+    """
+    symbol = (res.market.symbol if res.market else "") or token[:6]
+    since = int(res.market.pair_created_ms / 1000) if res.market and res.market.pair_created_ms else 0
+    await progress(f"Working out who made the most of {symbol}...")
+    report = await traders_pipeline.top_traders(
+        az(context), token, res.chain, since_ts=since, progress=progress)
+
+    if report.error:
+        await send(update, f"Top traders unavailable: {render.esc(report.error)}")
+        return 0
+
+    best = traders_pipeline.rank(report.traders, CFG.traders_count,
+                                 CFG.trader_min_spend_usd)
+    if not best:
+        return 0
+
+    await send(update, render.render_traders(report, az(context), CFG.traders_count))
+    wallets = [t.wallet for t in best]
+    return await do_track(
+        update, context, wallets,
+        evm_chain=res.chain if res.chain != "solana" else None,
+        source_token=token, labels=trader_labels(symbol, best), status=progress,
+    )
+
+
+@restricted
+@busy_guard
+async def cmd_traders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Who turned a small entry on this coin into a large exit."""
+    if not context.args:
+        await send(update, (
+            "Usage: <code>/traders &lt;token&gt; [n] [chain]</code>\n\n"
+            "Ranks the wallets that put in least and took out most. "
+            "Paste the coin's address."
+        ))
+        return
+
+    token = context.args[0]
+    limit = CFG.traders_count
+    if len(context.args) > 1 and context.args[1].isdigit():
+        limit = max(1, min(20, int(context.args[1])))
+    hint = chain_arg(context.args[1:])
+
+    status = await update.effective_message.reply_text("Resolving token...")
+    progress = Progress(status)
+    try:
+        chain, market, certain = await az(context).resolve_chain(token, hint)
+    except ValueError as exc:
+        await status.edit_text(str(exc))
+        return
+
+    if chain != "solana" and chain not in EVM_CHAINS:
+        await status.edit_text(
+            f"That token trades on {chain}, which this bot cannot query.")
+        return
+
+    symbol = (market.symbol if market else "") or token[:6]
+    await progress(f"Reading every trade on {symbol} ({chain})...")
+    since = int(market.pair_created_ms / 1000) if market and market.pair_created_ms else 0
+    report = await traders_pipeline.top_traders(
+        az(context), token, chain, since_ts=since, progress=progress)
+
+    if report.error:
+        await status.edit_text(report.error, parse_mode=ParseMode.HTML)
+        return
+
+    body = render.render_traders(report, az(context), limit)
+    try:
+        await status.delete()
+    except BadRequest:
+        pass
+    await send(update, body)
 
 
 @restricted
@@ -572,6 +785,28 @@ async def on_loose_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ), reply_markup=InlineKeyboardMarkup(buttons))
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Say something when a command raises, instead of going quiet.
+
+    Without this a handler that threw left no trace in the chat at all. /tracked
+    hit exactly that: Telegram refused the message, the exception went to the
+    log, and the command looked like it had been ignored.
+    """
+    log.exception("handler failed", exc_info=context.error)
+    message = getattr(update, "effective_message", None)
+    if not message:
+        return
+    try:
+        await message.reply_text(
+            f"That command failed: {type(context.error).__name__}: {context.error}"
+            "\n\nThe details are in the bot's log. /diag tests every data source."
+        )
+    except TelegramError:
+        # The reply is what failed in the first place often enough that this
+        # must never raise a second time.
+        log.warning("could not report the failure to the chat")
+
+
 @restricted
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -603,19 +838,191 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             evm_chain=cohort["chain"], source_token=cohort["token"],
             labels=harvest_labels(cohort["symbol"], wallets),
         )
+    elif action == "unt" and len(parts) == 3:
+        removed = await db.remove_wallet(conn(context), update.effective_chat.id,
+                                         parts[2])
+        await query.answer("Untracked" if removed else "Was not tracked")
+        await show_untrack_picker(update, context, int(parts[1]))
+    elif action == "untpg" and len(parts) == 2:
+        await show_untrack_picker(update, context, int(parts[1]))
+    elif action == "untidle":
+        idle = await db.idle_wallets(conn(context), update.effective_chat.id)
+        if not idle:
+            await show_untrack_picker(update, context, 0, "No idle wallets left.")
+            return
+        # Asked before doing: this drops many wallets at once and takes their
+        # position history with them.
+        await query.edit_message_text(
+            f"Untrack all <b>{len(idle)}</b> wallets that show no activity on any "
+            f"chain?\n\nTheir position history goes too. Re-harvesting the coin "
+            f"brings a wallet back, but not what it held before.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"Yes, untrack {len(idle)}",
+                                      callback_data="untidlego")],
+                [InlineKeyboardButton("No, keep them", callback_data="untpg|0")],
+            ]))
+    elif action == "untidlego":
+        chat_id = update.effective_chat.id
+        idle = await db.idle_wallets(conn(context), chat_id)
+        gone = sum(1 for a in idle
+                   if await db.remove_wallet(conn(context), chat_id, a))
+        await show_untrack_picker(update, context, 0,
+                                  f"Untracked <b>{gone}</b> idle wallet(s).")
+    elif action == "untl" and len(parts) == 2:
+        removed = await db.remove_wallet(conn(context), update.effective_chat.id,
+                                         parts[1])
+        await query.answer("Untracked" if removed else "Was not tracked")
+        # Only the button goes. Rewriting the board underneath it would
+        # renumber every rank the reader is in the middle of reading.
+        await _drop_button(query, f"untl|{parts[1]}")
     elif action == "tok" and len(parts) == 2:
         context.args = [parts[1]]
         await cmd_analyze(update, context)
 
 
+async def _drop_button(query, data: str) -> None:
+    """Take one button off a keyboard, leaving the message's text alone."""
+    markup = query.message.reply_markup if query.message else None
+    if not markup:
+        return
+    rows = [[b for b in row if b.callback_data != data]
+            for row in markup.inline_keyboard]
+    rows = [row for row in rows if row]
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    except BadRequest:
+        pass
+
+
 @restricted
 async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await send(update, "Usage: <code>/untrack &lt;wallet&gt;</code>")
+    """Stop tracking one or more wallets.
+
+    The address is pulled out of whatever was typed rather than taken as the
+    first word. Copying the usage line literally gives `/untrack <0x...>`, and
+    the angle brackets made it match nothing and report the wallet as untracked
+    while it carried on being watched. The same parsing accepts an explorer URL
+    or a whole column of addresses pasted at once.
+    """
+    addresses = extract_addresses(" ".join(context.args or []))
+    if not addresses:
+        # Nothing typed: show the list with a button each, rather than a usage
+        # line that asks the reader to go and find an address themselves.
+        await show_untrack_picker(update, context)
         return
-    removed = await db.remove_wallet(
-        conn(context), update.effective_chat.id, context.args[0])
-    await send(update, "Removed." if removed else "That wallet was not tracked.")
+
+    chat_id = update.effective_chat.id
+    removed = [a for a in addresses
+               if await db.remove_wallet(conn(context), chat_id, a)]
+    missing = [a for a in addresses if a not in removed]
+
+    lines = []
+    if removed:
+        lines.append(f"Untracked <b>{len(removed)}</b> wallet(s):")
+        lines += [f"- <code>{render.esc(short(a, 6, 6))}</code>" for a in removed]
+    if missing:
+        lines.append(f"\nNot tracked, so nothing to remove: "
+                     + ", ".join(f"<code>{render.esc(short(a, 4, 4))}</code>"
+                                 for a in missing))
+    await send(update, render.clip("\n".join(lines)))
+
+
+def wallet_untrack_keyboard(cards):
+    """An Untrack button for each wallet named above it.
+
+    Used by the leaderboard, where the reader is already looking at the
+    evidence for dropping a wallet and should not have to copy its address
+    into another command to act on it.
+    """
+    seen, buttons = set(), []
+    for card in cards:
+        if card.wallet in seen:
+            continue
+        seen.add(card.wallet)
+        name = card.label or short(card.wallet, 5, 5)
+        buttons.append([InlineKeyboardButton(
+            f"Untrack {name}", callback_data=f"untl|{card.wallet}")])
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+UNTRACK_PAGE = 8
+
+
+def untrack_keyboard(rows, page: int, pages: int, idle: int):
+    """A button per wallet, plus paging and a sweep for the idle ones.
+
+    One button per wallet rather than per wallet-chain pair: a multichain EVM
+    wallet has eight rows and would otherwise be offered eight times.
+    """
+    buttons = []
+    for row in rows:
+        name = row["label"] or short(row["address"], 6, 6)
+        mark = "" if row["live_chains"] else " (idle)"
+        buttons.append([InlineKeyboardButton(
+            f"Untrack {name}{mark}",
+            callback_data=f"unt|{page}|{row['address']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("< Back", callback_data=f"untpg|{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("More >", callback_data=f"untpg|{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    if idle:
+        buttons.append([InlineKeyboardButton(
+            f"Untrack all {idle} idle wallets", callback_data="untidle")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def show_untrack_picker(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              page: int = 0, notice: str = "") -> None:
+    """The list of tracked wallets, each with its own Untrack button."""
+    chat_id = update.effective_chat.id
+    rows = await db.wallet_summary(conn(context), chat_id)
+    if not rows:
+        text = "Nothing tracked yet. Start with /harvest &lt;token&gt;."
+        await _reply_or_edit(update, text, None)
+        return
+
+    idle = await db.idle_wallets(conn(context), chat_id)
+    pages = max(1, -(-len(rows) // UNTRACK_PAGE))
+    page = max(0, min(page, pages - 1))
+    slice_ = rows[page * UNTRACK_PAGE:(page + 1) * UNTRACK_PAGE]
+
+    lines = []
+    if notice:
+        lines.append(notice + "\n")
+    lines.append(f"<b>Tracking {len(rows)} wallet(s)</b> - page {page + 1} of {pages}")
+    if idle:
+        lines.append(f"{len(idle)} show no activity on any chain.")
+    lines.append("")
+    for row in slice_:
+        name = render.esc(row["label"]) if row["label"] else short(row["address"], 6, 6)
+        where = (f"live on {row['live_chains']} of {row['chains']} chains"
+                 if row["live_chains"] else "idle everywhere")
+        lines.append(f"- <b>{name}</b> <code>{short(row['address'], 4, 4)}</code>")
+        lines.append(f"   {where}")
+
+    await _reply_or_edit(update, "\n".join(lines),
+                         untrack_keyboard(slice_, page, pages, len(idle)))
+
+
+async def _reply_or_edit(update: Update, text: str, markup) -> None:
+    """Replace the picker in place when a button was pressed, so pruning a long
+    list does not bury the chat in near-identical messages."""
+    query = update.callback_query
+    if query:
+        try:
+            await query.edit_message_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                disable_web_page_preview=True)
+            return
+        except BadRequest:
+            pass          # the message is gone or unchanged; fall through
+    await send(update, text, reply_markup=markup)
 
 
 @restricted
@@ -652,7 +1059,9 @@ async def cmd_tracked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     settings = await db.get_settings(conn(context), update.effective_chat.id)
     watching = bool(settings and settings["watch"])
     lines.append(f"\nAlerts: <b>{'ON' if watching else 'OFF'}</b> (/watch on|off)")
-    await send(update, render.clip("\n".join(lines)))
+    # Not clipped: a wallet list is read to find one entry, and truncating it
+    # hides exactly the entry someone scrolled down for.
+    await send(update, "\n".join(lines))
 
 
 async def run_overlap_scan(database, analyzer: Analyzer, wallets_by_chain: dict,
@@ -820,13 +1229,16 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Rank tracked wallets by how their calls to you actually performed."""
     chat_id = update.effective_chat.id
-    rows = await db.outcomes_for_chat(conn(context), chat_id)
+    # Tracked wallets only. A wallet you untracked has no business ranking on
+    # a board you read to decide what to keep.
+    rows = await db.outcomes_for_chat(conn(context), chat_id, tracked_only=True)
     tracked = await db.list_wallets(conn(context), chat_id)
     labels = {r["address"]: r["label"] for r in tracked if r["label"]}
 
     cards = build_scorecards(rows, labels)
     summary = summarise(cards)
-    await send(update, render.render_leaderboard(cards, summary, az(context)))
+    await send(update, render.render_leaderboard(cards, summary, az(context)),
+               reply_markup=wallet_untrack_keyboard(cards[:12]))
 
     dead = stale_wallets(cards)
     weak = underperformers(cards)
@@ -840,9 +1252,9 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             who = render.esc(card.label or short(card.wallet, 5, 5))
             lines.append(f"  {who} - silent since {render.ago(card.last_signal_ts)}")
         lines.append("\n<i>Step 3 of the method is dropping the dead ones, and a "
-                     "wallet you tracked last month can die like any other. "
-                     "/untrack when you agree.</i>")
-        await send(update, render.clip("\n".join(lines)))
+                     "wallet you tracked last month can die like any other.</i>")
+        await send(update, render.clip("\n".join(lines)),
+                   reply_markup=wallet_untrack_keyboard(weak[:5] + dead[:5]))
 
 
 @restricted
@@ -945,6 +1357,33 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                   if r["address"].lower() == address.lower()), None)
     await status.delete()
     await send(update, render.render_portfolio(portfolio, az(context), label))
+
+
+@restricted
+@busy_guard
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Test every API key and say which one is actually broken."""
+    chains = [c for c in ("ethereum", "base", "bsc") if c in EVM_CHAINS]
+    extra = chain_arg(context.args or [])
+    if extra and extra not in chains:
+        chains.append(extra)
+
+    status = await update.effective_message.reply_text("Testing every data source...")
+    try:
+        checks, elapsed = await diagnostics.run(az(context), chains)
+    except Exception as exc:
+        log.exception("diag failed")
+        await status.edit_text(f"Diagnostics themselves failed: {exc}")
+        return
+
+    lines = [f"<b>Diagnostics</b> - {elapsed:.1f}s\n"]
+    for c in checks:
+        lines.append(f"[{c.mark}] <b>{render.esc(c.name)}</b>")
+        lines.append(f"     {render.esc(c.detail)}")
+    lines.append("")
+    lines.append(diagnostics.verdict(checks))
+    await status.delete()
+    await send(update, render.clip("\n".join(lines)))
 
 
 @restricted
@@ -1224,6 +1663,57 @@ async def autoharvest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.exception("autoharvest: send failed")
 
 
+async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the database to Telegram and pin it."""
+    chat_id = backup_chat_id()
+    if not (CFG.backup_enabled and chat_id):
+        return
+    database = context.application.bot_data["db"]
+    if await backup.is_empty(database):
+        log.debug("backup: nothing worth backing up yet")
+        return
+    await backup.send(context.bot, chat_id, database)
+
+
+@restricted
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force a backup now."""
+    chat_id = update.effective_chat.id
+    status = await update.effective_message.reply_text("Snapshotting the database...")
+    ok = await backup.send(context.bot, chat_id, conn(context))
+    await status.delete()
+    if not ok:
+        await send(update, "Backup failed - check the logs.")
+        return
+    await send(update, (
+        "Backed up and pinned. On a host with no disk this is what survives a "
+        "redeploy: tracked wallets, position baselines and the whole alert "
+        "history behind /leaderboard.\n\n"
+        f"<i>Runs automatically every {CFG.backup_interval_hours:g}h.</i>"
+    ))
+
+
+@restricted
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Restore from the pinned backup, or from a backup you reply to."""
+    chat_id = update.effective_chat.id
+    replied = update.effective_message.reply_to_message
+
+    status = await update.effective_message.reply_text("Restoring...")
+    # Nothing may hold the database open while the file is replaced.
+    database = context.application.bot_data.get("db")
+    if database is not None:
+        await database.close()
+        context.application.bot_data["db"] = None
+    try:
+        result = await backup.restore(context.bot, chat_id, replied)
+    finally:
+        context.application.bot_data["db"] = await db.connect()
+
+    await status.delete()
+    await send(update, render.esc(result))
+
+
 async def outcome_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Re-price every open alert so the leaderboard has something real to rank.
 
@@ -1264,9 +1754,45 @@ async def outcome_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ------------------------------------------------------------------------ wiring
+def backup_chat_id() -> int:
+    """Where backups go. The first allowed user unless told otherwise."""
+    if CFG.backup_chat_id:
+        return CFG.backup_chat_id
+    return min(CFG.allowed_user_ids) if CFG.allowed_user_ids else 0
+
+
 async def _post_init(app: Application) -> None:
     app.bot_data["db"] = await db.connect()
+
+    # On a host with no persistent disk the database is gone after every
+    # redeploy. If it comes up empty, pull the pinned backup out of Telegram
+    # before anything else touches it -- an empty database is not obviously
+    # broken, it just silently knows nothing.
+    chat_id = backup_chat_id()
+    if CFG.backup_enabled and CFG.backup_auto_restore and chat_id:
+        try:
+            if await backup.is_empty(app.bot_data["db"]):
+                log.info("database is empty - looking for a pinned backup")
+                await app.bot_data["db"].close()
+                result = await backup.restore(app.bot, chat_id)
+                log.info("restore: %s", result)
+                app.bot_data["db"] = await db.connect()
+                if "Restored" in result:
+                    await app.bot.send_message(
+                        chat_id,
+                        f"<b>Restored from backup</b>\n{render.esc(result)}\n\n"
+                        f"<i>The disk was empty after a restart, so I pulled the "
+                        f"pinned backup. Nothing was lost except anything that "
+                        f"happened since it was taken.</i>",
+                        parse_mode=ParseMode.HTML,
+                    )
+        except Exception:
+            log.exception("auto-restore failed; continuing with an empty database")
+            if app.bot_data["db"] is None:
+                app.bot_data["db"] = await db.connect()
+
     app.bot_data["analyzer"] = Analyzer()
+    await publish_command_menu(app.bot)
     log.info("memehunter ready")
 
 
@@ -1280,8 +1806,15 @@ async def _post_shutdown(app: Application) -> None:
 
 
 def build_app() -> Application:
+    # Generous timeouts. A long harvest keeps the connection open for a minute
+    # or more, and on a slow or lossy link the defaults give up mid-scan.
     app = (ApplicationBuilder()
            .token(CFG.telegram_token)
+           .connect_timeout(CFG.telegram_timeout)
+           .read_timeout(CFG.telegram_timeout)
+           .write_timeout(CFG.telegram_timeout)
+           .pool_timeout(CFG.telegram_timeout)
+           .get_updates_read_timeout(CFG.telegram_timeout + 20)
            .post_init(_post_init)
            .post_shutdown(_post_shutdown)
            .build())
@@ -1310,6 +1843,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("score", cmd_score))
     app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CommandHandler("harvest", cmd_harvest))
+    app.add_handler(CommandHandler("traders", cmd_traders))
     app.add_handler(CommandHandler("untrack", cmd_untrack))
     app.add_handler(CommandHandler("tracked", cmd_tracked))
     app.add_handler(CommandHandler("scan", cmd_scan))
@@ -1324,9 +1858,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("minscore", cmd_minscore))
     app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("label", cmd_label))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("restore", cmd_restore))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_error_handler(on_error)
     # Last: anything else that looks like an address gets the what-is-this prompt.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_loose_address))
 
@@ -1357,6 +1895,13 @@ def build_app() -> Application:
             first=600,
             name="autoharvest",
         )
+        if CFG.backup_enabled and backup_chat_id():
+            app.job_queue.run_repeating(
+                backup_job,
+                interval=CFG.backup_interval_hours * 3600,
+                first=900,
+                name="backup",
+            )
     else:
         log.warning(
             "No job queue available - install python-telegram-bot[job-queue]. "

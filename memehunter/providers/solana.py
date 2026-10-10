@@ -8,6 +8,7 @@ Three tiers of sourcing, best-effort in this order:
 from __future__ import annotations
 
 import asyncio
+import logging
 import statistics
 import time
 from typing import Any
@@ -19,6 +20,11 @@ TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 SOLSCAN = "https://pro-api.solscan.io/v2.0"
 HELIUS_API = "https://api.helius.xyz/v0"
+# Solana added transaction version 1 in 2026. Asking for at most version 0 makes
+# the RPC answer every newer transaction with an error instead of the
+# transaction, which read as "no buyers" on any coin launched since.
+MAX_TX_VERSION = 1
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
 
 # Programs / system accounts that appear as transfer counterparties but never trade.
 NON_WALLETS = {
@@ -28,14 +34,24 @@ NON_WALLETS = {
 }
 
 
+log = logging.getLogger("memehunter.solana")
+
+
 class HistoryTooDeep(RuntimeError):
     """Raised when the RPC fallback cannot reach a token's first transactions."""
 
 
 class SolanaProvider:
+    _solscan_note = ""
+    _solscan_headers: dict[str, str] | None = None
+
     def __init__(self) -> None:
         self.rpc_url = CFG.solana_rpc
         self.http = HttpClient(rate=8, per=1.0)
+        # Solscan's free plan allows 60 requests per MINUTE, not per second.
+        # Sharing the RPC client's 8/s would 429 immediately, which reads like
+        # a broken key, so Solscan gets its own much slower limiter.
+        self.solscan_http = HttpClient(rate=max(CFG.solscan_rpm, 1), per=60.0)
         self._id = 0
 
     # ------------------------------------------------------------------ raw RPC
@@ -74,23 +90,172 @@ class SolanaProvider:
 
     # ------------------------------------------------------- step 2: early buyers
     async def early_buyers(self, mint: str, limit: int) -> list[EarlyBuyer]:
-        if CFG.solscan_key:
+        # Why Solscan did not answer, carried into the fallback's error message.
+        # Swallowing this silently meant a failing key produced "set SOLSCAN_API_KEY"
+        # -- telling you to do the thing you had already done.
+        if not CFG.solscan_key:
+            self._solscan_note = ("SOLSCAN_API_KEY is not set in .env, or the bot was "
+                                  "started before you added it")
+        else:
             try:
                 buyers = await self._early_buyers_solscan(mint, limit)
                 if buyers:
                     return buyers
-            except Exception:
-                pass
+                self._solscan_note = ("your Solscan key works but returned no transfers "
+                                      "for this token")
+                log.warning("solscan returned no transfers for %s", mint)
+            except Exception as exc:
+                if self._is_auth_error(exc):
+                    said = self._api_message(exc)
+                    self._solscan_note = (
+                        "Solscan refused your key (401/403"
+                        + (f", it said: {said}" if said else "")
+                        + "). The key reached them and was rejected, so it is the "
+                        "key or the account - the Pro API needs a paid plan. Check "
+                        "solscan.io/user/profile#api_management"
+                    )
+                else:
+                    self._solscan_note = f"the Solscan request failed ({exc})"
+                log.warning("solscan early_buyers failed for %s: %r", mint, exc)
+
+        # Helius can read a token's history oldest-first in one call, which is
+        # exactly the question "who bought first" -- no walking back through
+        # every transaction since. Any coin, any size, a handful of credits.
+        if self.helius_rpc:
+            try:
+                buyers = await self._early_buyers_helius(mint, limit)
+                if buyers:
+                    return buyers
+                log.warning("helius returned no early buyers for %s", mint)
+            except Exception as exc:
+                log.warning("helius early_buyers failed for %s: %r", mint, exc)
+
         return await self._early_buyers_rpc(mint, limit)
 
+    @property
+    def helius_rpc(self) -> bool:
+        return "helius" in self.rpc_url.lower()
+
+    async def _early_buyers_helius(self, mint: str, limit: int) -> list[EarlyBuyer]:
+        """Helius `getTransactionsForAddress` with sortOrder=asc: the first
+        transactions ever to touch the mint, already parsed."""
+        buyers: dict[str, int] = {}
+        page_token = None
+        for _ in range(4):                       # up to 400 transactions
+            opts: dict[str, Any] = {
+                "sortOrder": "asc", "limit": 100, "transactionDetails": "full",
+                "encoding": "jsonParsed",
+                "maxSupportedTransactionVersion": MAX_TX_VERSION,
+            }
+            if page_token:
+                opts["paginationToken"] = page_token
+            res = await self.rpc("getTransactionsForAddress", [mint, opts])
+            if not isinstance(res, dict):
+                break
+            data = res.get("data") or []
+            for tx in data:
+                if (tx.get("meta") or {}).get("err"):
+                    continue
+                ts = int(tx.get("blockTime") or 0)
+                for owner in self._owners_gaining(tx, mint):
+                    buyers.setdefault(owner, ts)
+            page_token = res.get("paginationToken")
+            if len(buyers) >= limit + 5 or not page_token or len(data) < 100:
+                break
+        return await self._rank_buyers(buyers, limit)
+
+    async def _rank_buyers(self, buyers: dict[str, int], limit: int) -> list[EarlyBuyer]:
+        """Earliest first, minus the accounts that are programs rather than people."""
+        wallets = await self._only_wallets(list(buyers))
+        ordered = sorted(((a, t) for a, t in buyers.items() if a in wallets),
+                         key=lambda kv: kv[1])[:limit]
+        return [
+            EarlyBuyer(address=a, rank=i + 1, first_ts=ts, chain="solana")
+            for i, (a, ts) in enumerate(ordered)
+        ]
+
+    async def _only_wallets(self, addresses: list[str]) -> set[str]:
+        """Drop bonding curves, pool vault authorities and other program-owned
+        accounts. They receive tokens in the first transactions of every launch
+        and would otherwise sit at the top of the "early buyers" list.
+
+        A person's wallet is owned by the System Program. If the lookup itself
+        fails, keep everyone: a noisy list beats an empty one.
+        """
+        keep: set[str] = set()
+        for i in range(0, len(addresses), 100):
+            chunk = addresses[i:i + 100]
+            try:
+                res = await self.rpc("getMultipleAccounts",
+                                     [chunk, {"encoding": "base64"}]) or {}
+                values = res.get("value") or []
+            except Exception:
+                keep.update(chunk)
+                continue
+            if len(values) != len(chunk):
+                keep.update(chunk)
+                continue
+            for addr, info in zip(chunk, values):
+                if info is None or (info.get("owner") == SYSTEM_PROGRAM
+                                    and not info.get("executable")):
+                    keep.add(addr)
+        return keep
+
+    @staticmethod
+    def _is_auth_error(exc: Exception) -> bool:
+        resp = getattr(exc, "response", None)
+        return getattr(resp, "status_code", None) in (401, 403)
+
+    @staticmethod
+    def _api_message(exc: Exception) -> str:
+        """The message inside an API's error body, if it sent one."""
+        resp = getattr(exc, "response", None)
+        try:
+            body = resp.json()
+        except Exception:
+            return ""
+        if not isinstance(body, dict):
+            return ""
+        errors = body.get("errors")
+        msg = errors.get("message") if isinstance(errors, dict) else None
+        return str(msg or body.get("message") or "")[:160]
+
+    async def _solscan_get(self, path: str, params: dict[str, Any]) -> Any:
+        """GET from Solscan using whichever auth header this key is accepted with.
+
+        Solscan has used more than one header name across API versions, and a
+        mismatch is indistinguishable from a dead key -- both are a bare 401. So
+        rather than hardcode a guess, try each once and remember what worked.
+        If every variant is refused, the key itself is the problem (most often
+        an account with no active plan) and the caller says so.
+        """
+        key = CFG.solscan_key
+        variants = ([self._solscan_headers] if self._solscan_headers else
+                    [{"token": key}, {"Authorization": f"Bearer {key}"}, {"X-Token": key}])
+        last: Exception | None = None
+        for headers in variants:
+            try:
+                # retries=1: a 401 is a verdict, not a blip, so do not back off
+                # three times before trying the next header.
+                data = await self.solscan_http.get(f"{SOLSCAN}{path}", headers=headers,
+                                                   params=params, retries=1)
+                if self._solscan_headers != headers:
+                    log.info("solscan accepted the %s header", next(iter(headers)))
+                    self._solscan_headers = headers
+                return data
+            except Exception as exc:
+                last = exc
+                if not self._is_auth_error(exc):
+                    raise
+        self._solscan_headers = None
+        raise last or RuntimeError("solscan request failed")
+
     async def _early_buyers_solscan(self, mint: str, limit: int) -> list[EarlyBuyer]:
-        headers = {"token": CFG.solscan_key}
         seen: dict[str, int] = {}
         for page in range(1, 6):
-            data = await self.http.get(
-                f"{SOLSCAN}/token/transfer",
-                headers=headers,
-                params={
+            data = await self._solscan_get(
+                "/token/transfer",
+                {
                     "address": mint, "page": page, "page_size": 100,
                     "sort_by": "block_time", "sort_order": "asc",
                 },
@@ -113,8 +278,10 @@ class SolanaProvider:
         ]
 
     async def _early_buyers_rpc(self, mint: str, limit: int,
-                                max_pages: int = 30) -> list[EarlyBuyer]:
+                                max_pages: int | None = None) -> list[EarlyBuyer]:
         """Walk signatures backwards to the very first ones, then parse those txs."""
+        if max_pages is None:
+            max_pages = CFG.early_buyer_max_pages
         before: str | None = None
         oldest: list[dict] = []
         reached_genesis = False
@@ -136,10 +303,14 @@ class SolanaProvider:
         # Without reaching the first signature these are just "old" buyers, not
         # *early* ones -- returning them would quietly answer the wrong question.
         if not reached_genesis:
+            note = getattr(self, "_solscan_note", "")
             raise HistoryTooDeep(
                 f"This token has more than {max_pages * 1000:,} transactions, so the "
-                "public RPC cannot walk back to its first buyers. Set SOLSCAN_API_KEY "
-                "in .env (free tier is enough) to read the earliest trades directly."
+                f"public RPC cannot walk back to its first buyers."
+                + (f"\n\nSolscan was not usable here: {note}." if note else "")
+                + f"\n\nA Helius RPC (HELIUS_API_KEY in .env) reads any coin's first "
+                  f"buyers directly, whatever its size. Otherwise raise RPC_MAX_PAGES "
+                  f"(currently {max_pages}) or try a smaller coin."
             )
 
         # Chronological order, then parse enough transactions to fill `limit` buyers.
@@ -150,21 +321,17 @@ class SolanaProvider:
             results = await self.rpc_batch([
                 ("getTransaction",
                  [s["signature"], {"encoding": "jsonParsed",
-                                   "maxSupportedTransactionVersion": 0}])
+                                   "maxSupportedTransactionVersion": MAX_TX_VERSION}])
                 for s in batch
             ])
             for sig_info, tx in zip(batch, results):
                 ts = int(sig_info.get("blockTime") or 0)
                 for owner in self._owners_gaining(tx, mint):
                     buyers.setdefault(owner, ts)
-            if len(buyers) >= limit:
+            if len(buyers) >= limit + 5:
                 break
 
-        ordered = sorted(buyers.items(), key=lambda kv: kv[1])[:limit]
-        return [
-            EarlyBuyer(address=a, rank=i + 1, first_ts=ts, chain="solana")
-            for i, (a, ts) in enumerate(ordered)
-        ]
+        return await self._rank_buyers(buyers, limit)
 
     @staticmethod
     def _owners_gaining(tx: dict | None, mint: str) -> list[str]:
@@ -287,7 +454,7 @@ class SolanaProvider:
             results = await self.rpc_batch([
                 ("getTransaction",
                  [s["signature"], {"encoding": "jsonParsed",
-                                   "maxSupportedTransactionVersion": 0}])
+                                   "maxSupportedTransactionVersion": MAX_TX_VERSION}])
                 for s in batch
             ])
             for sig_info, tx in zip(batch, results):
@@ -344,6 +511,7 @@ class SolanaProvider:
 
     async def aclose(self) -> None:
         await self.http.aclose()
+        await self.solscan_http.aclose()
 
 
 def classify_bot(prof: WalletProfile) -> None:

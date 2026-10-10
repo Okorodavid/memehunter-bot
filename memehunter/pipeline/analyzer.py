@@ -57,6 +57,8 @@ class TokenAnalysis:
     survivors: list[WalletProfile] = field(default_factory=list)
     candidates: list[Candidate] = field(default_factory=list)
     error: str = ""
+    # True when no market data existed and the chain is a default, not a fact.
+    chain_guessed: bool = False
 
     @property
     def dead_count(self) -> int:
@@ -82,25 +84,35 @@ class Analyzer:
         return self.sol if chain == "solana" else self.evm(chain)
 
     # ------------------------------------------------------------------ helpers
-    async def resolve_chain(self, address: str) -> tuple[str, TokenMarket | None]:
-        """Which chain is this address on, and what does the market look like."""
+    async def resolve_chain(self, address: str, chain_hint: str | None = None
+                            ) -> tuple[str, TokenMarket | None, bool]:
+        """Which chain is this address on, what does the market look like, and
+        was the chain actually known or merely guessed?
+
+        The third value matters. An EVM address is valid on every EVM chain, so
+        a wrong guess queries a real lookup on the wrong network and comes back
+        empty -- indistinguishable from "this coin has no early buyers" unless
+        the caller can say which it was.
+        """
         kind = detect_chain(address)
         if kind is None:
             raise ValueError("That does not look like a Solana mint or an EVM address.")
         market = await self.dex.market(address)
         if kind == "solana":
-            return "solana", market
+            return "solana", market, True
+
+        # An explicit chain from the user beats anything inferred.
+        if chain_hint and chain_hint in EVM_CHAINS:
+            return chain_hint, market, True
 
         if market and market.chain:
             # An unrecognised chain is returned as-is so the caller can name it.
-            # Falling back to Ethereum here would query a real contract at the
-            # same address on the wrong chain and hand back wallets that were
-            # never early on anything.
-            return chain_from_dex_id(market.chain) or market.chain, market
+            return chain_from_dex_id(market.chain) or market.chain, market, True
 
-        # No pair anywhere: too new, or not a token. Ethereum is the only sane
-        # guess, and the lookup that follows will come back empty if it is wrong.
-        return "ethereum", market
+        # No pair anywhere: too new, delisted, not a token, or simply not
+        # indexed. Ethereum is the only sane default, but it is a guess and the
+        # caller must say so rather than reporting an empty result as fact.
+        return "ethereum", market, False
 
     def explorer_token(self, chain: str, token: str) -> str:
         if chain == "solana":
@@ -123,11 +135,13 @@ class Analyzer:
 
     # ------------------------------------------------------- steps 2 -> 4 only
     async def find_smart_wallets(
-        self, token: str, progress: Progress = _noop, limit: int | None = None
+        self, token: str, progress: Progress = _noop, limit: int | None = None,
+        chain_hint: str | None = None,
     ) -> TokenAnalysis:
         limit = limit or CFG.early_buyer_count
-        chain, market = await self.resolve_chain(token)
+        chain, market, certain = await self.resolve_chain(token, chain_hint)
         res = TokenAnalysis(token=token, chain=chain, market=market)
+        res.chain_guessed = not certain
 
         if chain != "solana" and chain not in EVM_CHAINS:
             res.error = (
@@ -137,20 +151,46 @@ class Analyzer:
             return res
         if chain != "solana" and not self.evm(chain).enabled:
             res.error = (
-                f"ETHERSCAN_API_KEY is not set, so {chain} is unavailable. "
-                f"One free key from etherscan.io/apis covers every EVM chain."
+                f"ETHERSCAN_API_KEY is not set and {chain} has no keyless public "
+                f"explorer, so it is unavailable. A key from etherscan.io/apis is "
+                f"needed, on a plan that includes {chain}."
             )
             return res
 
         prov = self.provider(chain)
         await progress(f"Step 2 - pulling the first {limit} buyers on {chain}...")
         try:
-            res.early_buyers = await prov.early_buyers(token, limit)
+            if chain == "solana":
+                res.early_buyers = await prov.early_buyers(token, limit)
+            else:
+                # When the pair appeared tells a keyless explorer where in the
+                # chain's history to start reading.
+                since = int(market.pair_created_ms / 1000) if market and market.pair_created_ms else 0
+                res.early_buyers = await prov.early_buyers(token, limit, since_ts=since)
         except HistoryTooDeep as exc:
             res.error = str(exc)
             return res
         if not res.early_buyers:
-            res.error = "No early buyers found. The address may be wrong or too new."
+            # An API that refused the request is not a coin without buyers.
+            api_error = getattr(prov, "last_error", "")
+            if api_error:
+                res.error = (
+                    f"The {chain} lookup failed, so this is not a verdict on the "
+                    f"coin.\n\n<b>{api_error}</b>\n\n"
+                    f"Run /diag to test every API key at once."
+                )
+            elif res.chain_guessed:
+                res.error = (
+                    f"No early buyers found on <b>{chain}</b>.\n\n"
+                    f"DexScreener has no pair for this token, so I could not tell "
+                    f"which chain it is on and defaulted to {chain}. If it is "
+                    f"somewhere else, say so:\n"
+                    f"<code>/harvest {token} base</code>\n\n"
+                    f"Chains: {', '.join(sorted(EVM_CHAINS))}."
+                )
+            else:
+                res.error = ("No early buyers found on "
+                             f"{chain}. The address may be wrong or too new.")
             return res
 
         await progress(
@@ -174,9 +214,10 @@ class Analyzer:
 
     # ----------------------------------------------------------- steps 5 -> 7
     async def analyze_token(
-        self, token: str, progress: Progress = _noop, limit: int | None = None
+        self, token: str, progress: Progress = _noop, limit: int | None = None,
+        chain_hint: str | None = None,
     ) -> TokenAnalysis:
-        res = await self.find_smart_wallets(token, progress, limit)
+        res = await self.find_smart_wallets(token, progress, limit, chain_hint)
         if res.error or not res.survivors:
             return res
 
@@ -280,7 +321,7 @@ class Analyzer:
         return cands
 
     async def score_one(self, token: str, overlap_wallets: int = 0) -> tuple[Candidate, str]:
-        chain, market = await self.resolve_chain(token)
+        chain, market, _ = await self.resolve_chain(token)
         prov = self.provider(chain)
         try:
             safety = await prov.token_safety(token)

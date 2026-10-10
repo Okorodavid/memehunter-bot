@@ -10,6 +10,8 @@ import asyncio
 import re
 import sys
 
+from . import dns
+from .config import CFG
 from .pipeline.analyzer import Analyzer
 from .render import render_analysis, render_candidate, render_score
 
@@ -21,6 +23,8 @@ def plain(html_text: str) -> str:
 
 
 async def run(command: str, token: str) -> None:
+    if CFG.dns_fix:
+        dns.install(CFG.dns_hosts, CFG.dns_resolvers)
     az = Analyzer()
 
     async def progress(text: str) -> None:

@@ -249,7 +249,11 @@ class HttpClient:
                     continue
                 resp.raise_for_status()
                 return resp.json()
-            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            except httpx.HTTPStatusError:
+                # A 401, 404 or similar is the API's answer. Retrying it three
+                # times with backoff only delayed the same answer by seconds.
+                raise
+            except httpx.TransportError as exc:
                 last_exc = exc
                 await asyncio.sleep(1.0 * (2 ** attempt))
         raise last_exc or RuntimeError(f"request failed: {url}")
