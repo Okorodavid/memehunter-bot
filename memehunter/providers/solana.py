@@ -166,7 +166,7 @@ class SolanaProvider:
 
     async def _rank_buyers(self, buyers: dict[str, int], limit: int) -> list[EarlyBuyer]:
         """Earliest first, minus the accounts that are programs rather than people."""
-        wallets = await self._only_wallets(list(buyers))
+        wallets = await self.only_wallets(list(buyers))
         ordered = sorted(((a, t) for a, t in buyers.items() if a in wallets),
                          key=lambda kv: kv[1])[:limit]
         return [
@@ -174,7 +174,7 @@ class SolanaProvider:
             for i, (a, ts) in enumerate(ordered)
         ]
 
-    async def _only_wallets(self, addresses: list[str]) -> set[str]:
+    async def only_wallets(self, addresses: list[str]) -> set[str]:
         """Drop bonding curves, pool vault authorities and other program-owned
         accounts. They receive tokens in the first transactions of every launch
         and would otherwise sit at the top of the "early buyers" list.
@@ -361,7 +361,7 @@ class SolanaProvider:
         prof = WalletProfile(address=address, chain="solana")
         try:
             sigs = await self.rpc(
-                "getSignaturesForAddress", [address, {"limit": 300}]) or []
+                "getSignaturesForAddress", [address, {"limit": 1000}]) or []
         except Exception:
             prof.dead = True
             return prof
@@ -376,6 +376,7 @@ class SolanaProvider:
         window = now - CFG.active_window_days * 86400
         recent = [t for t in times if t >= window]
         prof.tx_count_30d = len(recent)
+        prof.tx_per_day = daily_rate(recent)
 
         gaps = [a - b for a, b in zip(recent, recent[1:])] if len(recent) > 1 else []
         if gaps:
@@ -514,12 +515,27 @@ class SolanaProvider:
         await self.solscan_http.aclose()
 
 
+def daily_rate(times: list[int]) -> float:
+    """Transactions per day over the span these timestamps cover, newest first.
+
+    Dividing a capped sample by the whole activity window made the volume rule
+    unreachable: 300 fetched rows over 30 days is 10 a day for any wallet. The
+    span is floored at one day so a handful of quick transactions from a fresh
+    wallet does not extrapolate into thousands.
+    """
+    if len(times) < 2:
+        return 0.0
+    return len(times) / max((times[0] - times[-1]) / 86400, 1.0)
+
+
 def classify_bot(prof: WalletProfile) -> None:
     """Step 4 heuristics: speed and volume are what separate a bot from a human."""
     reasons = []
-    if prof.median_gap_sec and prof.median_gap_sec < CFG.bot_min_median_gap_sec:
+    # A median of zero is the fastest there is, not a missing measurement, so
+    # the sample size says whether there were gaps to measure at all.
+    if prof.tx_count_30d > 1 and prof.median_gap_sec < CFG.bot_min_median_gap_sec:
         reasons.append(f"median gap {prof.median_gap_sec:.1f}s between txs")
-    per_day = prof.tx_count_30d / max(CFG.active_window_days, 1)
+    per_day = prof.tx_per_day or prof.tx_count_30d / max(CFG.active_window_days, 1)
     if per_day > CFG.bot_max_tx_per_day:
         reasons.append(f"{per_day:.0f} tx/day")
     if prof.min_gap_sec and prof.min_gap_sec < 1 and prof.tx_count_30d > 200:

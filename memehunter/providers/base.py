@@ -156,6 +156,10 @@ class WalletProfile:
     chain: str
     last_active_ts: int = 0
     tx_count_30d: int = 0
+    # Rate across the span the sample actually covers. tx_count_30d alone cannot
+    # give it: history is fetched a page at a time, so the count stops at the
+    # page size however busy the wallet is.
+    tx_per_day: float = 0.0
     median_gap_sec: float = 0.0
     min_gap_sec: float = 0.0
     is_bot: bool = False

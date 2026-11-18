@@ -1009,7 +1009,7 @@ async def test_solana_trader_scan() -> None:
                                  _sol_tx("FAILED", MINT, 500.0, -9.0, err={"x": 1})]}
             return {"data": [_sol_tx("HERO", MINT, -1000.0, 6.0)]}
 
-        async def _only_wallets(self, addresses):
+        async def only_wallets(self, addresses):
             return {a for a in addresses if a != "POOL"}       # POOL is a program
 
     class FakeDex:
@@ -1253,6 +1253,85 @@ async def test_leaderboard_drops_untracked_wallets() -> None:
         object.__setattr__(CFG, "db_path", original or "memehunter.db")
 
 
+# ------------------------------------------------------------ wallet screen
+async def test_evm_contracts_are_not_wallets() -> None:
+    """Two of a Base coin's own contracts were harvested as early buyers and
+    tracked for weeks. Code at the address is the proof; a 7702 delegation is
+    a person's wallet wearing a marker, and a failed lookup proves nothing."""
+    from memehunter.providers import evm as E
+
+    EOA, CONTRACT, DELEGATED = "0xaa", "0xbb", "0xcc"
+    code = {EOA: "0x", CONTRACT: "0x6080604052",
+            DELEGATED: "0xef010063c0c19a282a1b52b07dd5a65b58948a07dae32b"}
+
+    class Node:
+        def __init__(self, fail=False): self.fail = fail
+        async def post(self, url, json=None):
+            if self.fail:
+                raise RuntimeError("node down")
+            return [{"id": c["id"], "result": code[c["params"][0]]} for c in json]
+        async def aclose(self): pass
+
+    p = E.EvmProvider("base")
+    p.v2_http = Node()
+    kept = await p.only_wallets([EOA, CONTRACT, DELEGATED])
+    check("a contract is dropped", CONTRACT not in kept)
+    check("a plain wallet is kept", EOA in kept)
+    check("a 7702-delegated wallet is kept", DELEGATED in kept)
+
+    p.v2_http = Node(fail=True)
+    check("a failed lookup rejects nobody",
+          await p.only_wallets([EOA, CONTRACT]) == {EOA, CONTRACT})
+
+    blind = E.EvmProvider("robinhood")
+    check("a chain with no node rejects nobody",
+          await blind.only_wallets([CONTRACT]) == {CONTRACT})
+
+    async def transfers(*a, **kw):
+        return [{"from": "0xpool", "to": to, "timeStamp": str(i)}
+                for i, to in enumerate([CONTRACT, EOA, DELEGATED], 1)]
+    p.v2_http, p._call = Node(), transfers
+    p._use_fallback = False
+    buyers = await p.early_buyers("0xtoken", 2)
+    check("early buyers skip the contract and still fill the limit",
+          [b.address for b in buyers] == [EOA, DELEGATED],
+          str([b.address for b in buyers]))
+
+
+async def test_screen_before_tracking() -> None:
+    """The top-traders harvest tracked whatever ranked best, bots included."""
+    from memehunter import bot as B
+    from memehunter.providers.base import WalletProfile
+
+    HUMAN, BOT, PROGRAM = ("So1" + c * 40 for c in "abc")
+
+    class Prov:
+        def __init__(self): self.profiled = []
+        async def only_wallets(self, addresses):
+            return {a for a in addresses if a != PROGRAM}
+        async def wallet_profile(self, address):
+            self.profiled.append(address)
+            return WalletProfile(address=address, chain="solana",
+                                 is_bot=address == BOT, bot_reason="900 tx/day")
+
+    class Az:
+        def __init__(self): self.prov = Prov()
+        def provider(self, chain): return self.prov
+
+    az = Az()
+    keep, rejected = await B.screen_wallets(az, [HUMAN, BOT, PROGRAM], bots=True)
+    check("only the person survives a harvest screen", keep == [HUMAN], str(keep))
+    check("the rejection says why", rejected[BOT] == "bot: 900 tx/day"
+          and "contract" in rejected[PROGRAM], str(rejected))
+    check("a non-wallet is never profiled", PROGRAM not in az.prov.profiled)
+
+    az = Az()
+    keep, rejected = await B.screen_wallets(az, [HUMAN, BOT, PROGRAM])
+    check("a hand-typed bot is the user's call", keep == [HUMAN, BOT], str(keep))
+    check("a hand-typed contract is still refused", list(rejected) == [PROGRAM])
+    check("no profiling cost on a manual add", az.prov.profiled == [])
+
+
 async def run(check_fn=None) -> tuple[int, int]:
     """Run every check. selftest.py passes its own `check` so the totals pool."""
     global check
@@ -1301,6 +1380,10 @@ async def run(check_fn=None) -> tuple[int, int]:
     test_trader_ranking()
     test_solana_trade_reading()
     await test_solana_trader_scan()
+
+    print("\nwallet screen")
+    await test_evm_contracts_are_not_wallets()
+    await test_screen_before_tracking()
 
     print("\nuntracking")
     await test_wallet_summary_and_idle()

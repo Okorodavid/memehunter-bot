@@ -405,12 +405,61 @@ def trader_labels(symbol: str, traders) -> dict[str, str]:
     return {t.wallet: f"{symbol} {t.multiple:,.0f}x" for t in traders}
 
 
+async def screen_wallets(analyzer: Analyzer, addresses: list[str],
+                         evm_chain: str | None = None,
+                         bots: bool = False) -> tuple[list[str], dict[str, str]]:
+    """Split addresses into those worth tracking and those that are not a
+    person, with the reason for each rejection.
+
+    Every add passes through here, because every way in has let something
+    through: a harvest on Base saved the coin's own contracts as "early
+    buyers", and the top-traders harvest saved bots since nothing profiled
+    them. `bots` is for cohorts the bot picked itself; an address typed in by
+    hand is only refused when it provably is not a wallet. A lookup that
+    fails rejects nobody.
+    """
+    by_chain: dict[str, list[str]] = {}
+    for address in addresses:
+        kind = detect_chain(address)
+        if kind:
+            chain = "solana" if kind == "solana" else (evm_chain or "ethereum")
+            by_chain.setdefault(chain, []).append(address)
+
+    rejected: dict[str, str] = {}
+    sem = asyncio.Semaphore(4)
+    for chain, group in by_chain.items():
+        prov = analyzer.provider(chain)
+        try:
+            wallets = await prov.only_wallets(group)
+        except Exception:
+            log.exception("wallet screen failed on %s", chain)
+            wallets = set(group)
+        for address in group:
+            if address not in wallets:
+                rejected[address] = "contract, not a wallet"
+        if not bots:
+            continue
+
+        async def profile(address: str, prov=prov) -> None:
+            async with sem:
+                try:
+                    prof = await prov.wallet_profile(address)
+                except Exception:
+                    return
+            if prof.is_bot:
+                rejected[address] = f"bot: {prof.bot_reason}"
+
+        await asyncio.gather(*(profile(a) for a in group if a in wallets))
+
+    return [a for a in addresses if a not in rejected], rejected
+
+
 async def do_track(update: Update, context: ContextTypes.DEFAULT_TYPE,
                    addresses: list[str], label: str | None = None,
                    evm_chain: str | None = None,
                    source_token: str | None = None,
                    labels: dict[str, str] | None = None,
-                   status: Any = None) -> int:
+                   status: Any = None, screen_bots: bool = False) -> int:
     """Add wallets, seed their current positions, and report what happened.
 
     Insertion happens first and seeding second, in one concurrent pass per chain --
@@ -418,6 +467,8 @@ async def do_track(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """
     chat_id = update.effective_chat.id
     labels = labels or {}
+    addresses, rejected = await screen_wallets(
+        az(context), addresses, evm_chain, bots=screen_bots)
     added: list[tuple[str, str]] = []
     duplicate: list[str] = []
     by_chain: dict[str, list[str]] = {}
@@ -448,8 +499,15 @@ async def do_track(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                        this_label, source_token, auto=True):
                     by_chain.setdefault(extra, []).append(address)
 
+    skipped = [f"- <code>{short(a, 6, 6)}</code> {render.esc(why)}"
+               for a, why in list(rejected.items())[:12]]
+    if len(rejected) > 12:
+        skipped.append(f"...and {len(rejected) - 12} more")
+    if skipped:
+        skipped.insert(0, f"<b>Skipped {len(rejected)}</b>")
+
     if not added and not duplicate:
-        await send(update, "No valid addresses in that.")
+        await send(update, "\n".join(skipped) or "No valid addresses in that.")
         return 0
 
     # Seed the position snapshot so the first alert is a genuinely new buy. A wallet
@@ -492,6 +550,8 @@ async def do_track(update: Update, context: ContextTypes.DEFAULT_TYPE,
         lines.append("\nAlready tracked: "
                      + ", ".join(f"<code>{short(a, 4, 4)}</code>"
                                  for a in duplicate[:10]))
+    if skipped:
+        lines.append("\n" + "\n".join(skipped))
 
     settings = await db.get_settings(conn(context), chat_id)
     if added and not (settings and settings["watch"]):
@@ -603,6 +663,7 @@ async def harvest_top_traders(update: Update, context: ContextTypes.DEFAULT_TYPE
         update, context, wallets,
         evm_chain=res.chain if res.chain != "solana" else None,
         source_token=token, labels=trader_labels(symbol, best), status=progress,
+        screen_bots=True,
     )
 
 

@@ -20,7 +20,7 @@ import httpx
 
 from ..config import CFG
 from .base import EVM_CHAINS, IGNORE_LOWER, EarlyBuyer, Holding, HttpClient, WalletProfile
-from .solana import classify_bot
+from .solana import classify_bot, daily_rate
 
 ETHERSCAN_V2 = "https://api.etherscan.io/v2/api"
 
@@ -51,6 +51,18 @@ PUBLIC_RPC = {
     "arbitrum": "https://arb1.arbitrum.io/rpc",
     "polygon": "https://polygon-rpc.com",
 }
+# Nodes asked one cheap question: does this address hold code? Wider than
+# PUBLIC_RPC because any public node answers eth_getCode, including the ones
+# that refuse eth_getLogs.
+CODE_RPC = {
+    **PUBLIC_RPC,
+    "ethereum": "https://ethereum-rpc.publicnode.com",
+    "bsc": "https://bsc-dataseed.binance.org",
+    "avalanche": "https://api.avax.network/ext/bc/C/rpc",
+}
+# EIP-7702: a person's wallet that has delegated to a contract carries this
+# marker followed by the delegate's address. It is still a person's wallet.
+DELEGATED_PREFIX = "0xef0100"
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 # Etherscan's wording when the key is fine but the plan does not include the chain.
@@ -225,6 +237,36 @@ class EvmProvider:
         if data.get("error"):
             raise RuntimeError(f"{method}: {data['error'].get('message')}")
         return data.get("result")
+
+    async def only_wallets(self, addresses: list[str]) -> set[str]:
+        """Drop routers, pools, token contracts and anything else holding code.
+
+        They receive tokens in a launch's first transfers and so rank as early
+        buyers, then "trade" all day. If the chain has no node to ask, or the
+        lookup fails, keep everyone: a noisy list beats an empty one.
+        """
+        url = CODE_RPC.get(self.chain)
+        if not url:
+            return set(addresses)
+        keep: set[str] = set()
+        for i in range(0, len(addresses), 50):
+            chunk = addresses[i:i + 50]
+            body = [{"jsonrpc": "2.0", "id": n, "method": "eth_getCode",
+                     "params": [a, "latest"]} for n, a in enumerate(chunk)]
+            try:
+                data = await self.v2_http.post(url, json=body)
+            except Exception as exc:
+                log.warning("%s eth_getCode: %r", self.chain, exc)
+                keep.update(chunk)
+                continue
+            answers = data if isinstance(data, list) else []
+            by_id = {d.get("id"): d for d in answers if isinstance(d, dict)}
+            for n, addr in enumerate(chunk):
+                code = (by_id.get(n) or {}).get("result")
+                if (not isinstance(code, str) or code in ("0x", "0x0")
+                        or code.lower().startswith(DELEGATED_PREFIX)):
+                    keep.add(addr)
+        return keep
 
     async def _block_at(self, number: int | str) -> tuple[int, int]:
         tag = number if isinstance(number, str) else hex(number)
@@ -404,10 +446,13 @@ class EvmProvider:
             if not to or to in IGNORE_LOWER or to in distributors or to == token.lower():
                 continue
             buyers.setdefault(to, ts)
-            if len(buyers) >= limit:
+            # Headroom for the contracts about to be dropped.
+            if len(buyers) >= limit * 3:
                 break
 
-        ordered = sorted(buyers.items(), key=lambda kv: kv[1])[:limit]
+        wallets = await self.only_wallets(list(buyers))
+        ordered = sorted(((a, ts) for a, ts in buyers.items() if a in wallets),
+                         key=lambda kv: kv[1])[:limit]
         return [
             EarlyBuyer(address=a, rank=i + 1, first_ts=ts, chain=self.chain)
             for i, (a, ts) in enumerate(ordered)
@@ -437,6 +482,7 @@ class EvmProvider:
         window = time.time() - CFG.active_window_days * 86400
         recent = [t for t in times if t >= window]
         prof.tx_count_30d = len(recent)
+        prof.tx_per_day = daily_rate(recent)
         gaps = [a - b for a, b in zip(recent, recent[1:])] if len(recent) > 1 else []
         if gaps:
             prof.median_gap_sec = float(statistics.median(gaps))

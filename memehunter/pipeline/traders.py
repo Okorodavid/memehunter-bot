@@ -221,7 +221,7 @@ async def _solana_traders(analyzer, token: str, report: TraderReport,
                 trader.sell_txns += 1
 
     # Pools, bonding curves and vaults trade constantly and are not people.
-    wallets = await sol._only_wallets(list(by_wallet))
+    wallets = await sol.only_wallets(list(by_wallet))
     prices = await analyzer.dex.markets([WSOL])
     sol_price = prices.get(WSOL).price_usd if prices.get(WSOL) else 0.0
 
