@@ -156,6 +156,10 @@ class WalletProfile:
     chain: str
     last_active_ts: int = 0
     tx_count_30d: int = 0
+    # Rate across the span the sample actually covers. tx_count_30d alone cannot
+    # give it: history is fetched a page at a time, so the count stops at the
+    # page size however busy the wallet is.
+    tx_per_day: float = 0.0
     median_gap_sec: float = 0.0
     min_gap_sec: float = 0.0
     is_bot: bool = False
@@ -249,7 +253,11 @@ class HttpClient:
                     continue
                 resp.raise_for_status()
                 return resp.json()
-            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            except httpx.HTTPStatusError:
+                # A 401, 404 or similar is the API's answer. Retrying it three
+                # times with backoff only delayed the same answer by seconds.
+                raise
+            except httpx.TransportError as exc:
                 last_exc = exc
                 await asyncio.sleep(1.0 * (2 ** attempt))
         raise last_exc or RuntimeError(f"request failed: {url}")

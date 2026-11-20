@@ -2,3 +2,8 @@
 *.db
 __pycache__/
 *.pyc
+*.log
+Claude outputs/
+*.db-journal
+*.db-wal
+*.db-shm

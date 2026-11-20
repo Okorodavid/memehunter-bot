@@ -1,0 +1,9 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.db
+.env
+_shims/
+Claude outputs/
+*.md

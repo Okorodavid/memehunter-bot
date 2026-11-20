@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import re
 import time
 
 from .config import CFG
@@ -43,8 +44,77 @@ def ago(ts: int) -> str:
     return f"{delta / 86400:.0f}d ago"
 
 
-def clip(text: str) -> str:
-    return text if len(text) <= MAX_MSG else text[:MAX_MSG] + "\n...(truncated)"
+TAG = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)[^>]*>")
+TRUNCATED = "\n...(truncated)"
+
+
+def _repair(chunk: str) -> str:
+    """Make a cut piece of HTML something Telegram will accept.
+
+    Cutting at a fixed character count lands inside a tag sooner or later. When
+    it does, Telegram refuses the whole message with `Can't parse entities:
+    unclosed start tag`, the command raises, and nothing is sent at all -- which
+    is how /tracked went silent once the list passed 3,900 characters.
+    """
+    opened = chunk.rfind("<")
+    if opened != -1 and chunk.find(">", opened) == -1:
+        chunk = chunk[:opened]               # half a tag, drop it
+
+    stack: list[str] = []
+    for match in TAG.finditer(chunk):
+        name = match.group(2).lower()
+        if not match.group(1):
+            stack.append(name)
+        elif name in stack:
+            while stack and stack.pop() != name:
+                pass
+    return chunk + "".join(f"</{name}>" for name in reversed(stack))
+
+
+def clip(text: str, limit: int = MAX_MSG) -> str:
+    """One message, cut at a line boundary rather than mid-tag.
+
+    Closing the tags left open at the cut makes the piece longer than the cut
+    itself, so the budget is walked back until the finished message fits. A
+    message one character over the limit is refused just as firmly as one that
+    is a thousand over.
+    """
+    if len(text) <= limit:
+        return text
+    budget = limit - len(TRUNCATED)
+    while budget > 0:
+        cut = text.rfind("\n", 0, budget)
+        piece = _repair(text[:cut if cut > 0 else budget].rstrip()) + TRUNCATED
+        if len(piece) <= limit:
+            return piece
+        budget -= max(len(piece) - limit, 1)
+    return TRUNCATED.lstrip()
+
+
+def pages(text: str, limit: int = MAX_MSG) -> list[str]:
+    """The same text as consecutive messages, so nothing has to be thrown away.
+
+    A list of wallets is worth reading in full; truncating it hides exactly the
+    entries someone scrolled down to find.
+    """
+    out: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        if len(line) > limit:                # one enormous line: nothing to split on
+            if current:
+                out.append(current)
+                current = ""
+            out.append(clip(line, limit))
+            continue
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            out.append(current)
+            current = line
+    if current:
+        out.append(current)
+    return out or [text]
 
 
 def score_bar(total: float) -> str:
@@ -380,3 +450,56 @@ def render_alert(cand: Candidate, wallet: str, az: Analyzer, label: str | None,
         lines.append("\n<i>Their size is not your size. Mirror the conviction, "
                      "not the ticket.</i>")
     return clip("\n".join(lines))
+
+
+def tokens(amount: float) -> str:
+    """A token count at a glance, not to the last decimal."""
+    for size, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(amount) >= size:
+            return f"{amount / size:.1f}{suffix}"
+    return f"{amount:,.0f}"
+
+
+def render_traders(report, az, limit: int) -> str:
+    """The wallets that turned a small entry into a large exit."""
+    from .pipeline.traders import rank
+
+    name = esc(report.token[:6])
+    best = rank(report.traders, limit, CFG.trader_min_spend_usd)
+    if not best:
+        return (f"No wallet on <code>{esc(report.token)}</code> both bought for at "
+                f"least {usd(CFG.trader_min_spend_usd)} and sold again"
+                + (f", across the {report.scanned} wallets read."
+                   if report.scanned else "."))
+
+    lines = [f"<b>Top {len(best)} traders on {name}</b> - smallest entry, biggest exit\n"]
+    for i, t in enumerate(best, 1):
+        link = az.explorer_wallet(t.chain, t.wallet)
+        held = " - still holding" if t.holding else ""
+        lines.append(
+            f'{i}. <a href="{link}"><code>{short(t.wallet, 4, 4)}</code></a>  '
+            f"<b>{t.multiple:,.0f}x</b>{held}"
+        )
+        lines.append(
+            f"   in {usd(t.spent_usd)} ({tokens(t.bought_tokens)} / {t.buy_txns} tx)"
+            f"  out {usd(t.received_usd)} ({tokens(t.sold_tokens)} / {t.sell_txns} tx)"
+        )
+        lines.append(f"   profit <b>{usd(t.pnl_usd)}</b>")
+
+    lines.append(f"\nRead {report.scanned} wallet(s).")
+    if report.cohort_only:
+        lines.append(
+            "<i>Only the early buyers, not every trader: a keyless node cannot read "
+            "a whole EVM token's history.</i>"
+        )
+    if report.partial:
+        lines.append(
+            "<i>This coin has more history than one scan covers, so the middle of "
+            "its life is missing. Raise TRADER_SCAN_PAGES to read deeper.</i>"
+        )
+    lines.append(
+        f"<i>Multiples are exact, in {esc(best[0].quote_symbol)}. Dollar figures "
+        f"price old trades at today's rate, so read them as scale, not as a "
+        f"statement.</i>"
+    )
+    return "\n".join(lines)

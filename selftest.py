@@ -14,7 +14,8 @@ from memehunter.pipeline.scoring import score_token                   # noqa: E4
 from memehunter.providers.base import (Holding, TokenMarket,          # noqa: E402
                                        WalletProfile, detect_chain,
                                        extract_addresses)
-from memehunter.providers.solana import SolanaProvider, classify_bot  # noqa: E402
+from memehunter.providers.solana import (SolanaProvider, classify_bot,  # noqa: E402
+                                         daily_rate)
 from memehunter.bot import harvest_labels                             # noqa: E402
 import tests_auto                                                     # noqa: E402
 import tests_exits                                                    # noqa: E402
@@ -143,6 +144,29 @@ def test_bot_filter() -> None:
                             median_gap_sec=60, min_gap_sec=30)
     classify_bot(grinder)
     check("high-volume wallet flagged", grinder.is_bot, grinder.bot_reason)
+
+    burst = WalletProfile(address="w", chain="solana", tx_count_30d=300,
+                          median_gap_sec=0.0, min_gap_sec=0.0)
+    classify_bot(burst)
+    check("same-second median is the fastest, not missing data", burst.is_bot)
+
+    single = WalletProfile(address="w", chain="solana", tx_count_30d=1)
+    classify_bot(single)
+    check("one transaction has no gap to judge", not single.is_bot)
+
+    now = 1_800_000_000
+    six_hours = [now - i * 72 for i in range(300)]
+    check("a full page in six hours is 300 a day", daily_rate(six_hours) == 300)
+    capped = WalletProfile(address="w", chain="solana", tx_count_30d=300,
+                           tx_per_day=daily_rate(six_hours),
+                           median_gap_sec=72, min_gap_sec=72)
+    classify_bot(capped)
+    check("a capped sample still trips the volume rule", capped.is_bot,
+          capped.bot_reason)
+    check("a page spread over ten days is 30 a day",
+          round(daily_rate([now - i * 2880 for i in range(300)])) == 30)
+    check("five quick transactions are not extrapolated",
+          daily_rate([now - i for i in range(5)]) == 5)
 
 
 def test_balance_parsing() -> None:
